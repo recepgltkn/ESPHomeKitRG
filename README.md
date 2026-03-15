@@ -9,6 +9,7 @@ Bu proje ile:
 - cihazi USB baglamadan OTA ile guncelleyebilirsiniz
 - cihaz durumunu HTTP uzerinden gorebilirsiniz
 - loglari Telnet uzerinden izleyebilirsiniz
+- yeni bir eve goturdugunuzde Wi-Fi ayarlarini web arayuzunden degistirebilirsiniz
 
 ## Donanim
 
@@ -36,6 +37,8 @@ Eger kullandiginiz role karti ters lojik ile calisiyorsa `src/main.cpp` icindeki
 - `ArduinoOTA` ile kablosuz firmware guncelleme destekler
 - HTTP JSON status endpoint sunar
 - Telnet log portu sunar
+- Wi-Fi kurulum sayfasi sunar
+- mevcut ağa baglanamazsa kendi setup access point'ini acar
 
 ## Proje Yapisi
 
@@ -96,6 +99,57 @@ Cihaz agda calisiyorsa USB olmadan guncelleme yapabilirsiniz:
 
 PlatformIO IP adresi gordugunde otomatik olarak `espota` kullanir.
 
+## Wi-Fi Kurulum Modu
+
+Bu proje tasinabilir kullanim icin Wi-Fi kurulum modu icerir.
+
+Calisma mantigi:
+
+- cihaz acilista hem mevcut Wi-Fi'ye baglanmayi dener
+- hem de gecici kurulum agini acar
+
+Kurulum access point adi:
+
+```text
+Wemos-Setup
+```
+
+Iki farkli kullanim vardir:
+
+### 1. Cihaz mevcut Wi-Fi'ye baglanirsa
+
+Bu durumda setup access point kapanir ama ayar sayfasi cihazin normal IP adresinde acik kalir:
+
+```text
+http://cihaz-ip/setup
+```
+
+Ornek:
+
+```text
+http://192.168.68.101/setup
+```
+
+### 2. Cihaz mevcut Wi-Fi'ye baglanamazsa
+
+Bu durumda `Wemos-Setup` acik kalir.
+
+Telefondan veya bilgisayardan bu aga baglanip su adrese gidersiniz:
+
+```text
+http://192.168.4.1/setup
+```
+
+Bu sayfa:
+
+- yakindaki Wi-Fi aglarini tarar
+- SSID secmenize veya elle yazmaniza izin verir
+- sifre girmenizi saglar
+- bilgileri cihaza kaydeder
+- cihazi yeniden baslatir
+
+Wi-Fi bilgileri cihaz uzerinde `LittleFS` icinde saklanir.
+
 ## HTTP Durum Endpoint'i
 
 Varsayilan endpoint:
@@ -112,6 +166,7 @@ JSON olarak su bilgileri doner:
 - IP, gateway, subnet, DNS
 - MAC, BSSID, kanal, RSSI
 - Wi-Fi reconnect sayaçlari
+- setup endpoint bilgisi
 - role durumu
 - HomeKit istemci sayisi
 - uptime
@@ -156,6 +211,7 @@ Not:
 - HTTP: `80`
 - Telnet: `23`
 - OTA: `8266`
+- Setup AP fallback IP: `192.168.4.1`
 
 ## Git
 

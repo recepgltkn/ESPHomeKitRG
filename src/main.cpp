@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <ArduinoOTA.h>
@@ -18,6 +19,8 @@ extern homekit_characteristic_t cha_switch_on;
 #define RELAY_INACTIVE_LEVEL HIGH
 #define HTTP_PORT 80
 #define TELNET_PORT 23
+#define WIFI_CONFIG_FILE "/wifi.txt"
+#define WIFI_SETUP_AP "Wemos-Setup"
 
 static uint32_t next_status_log_ms = 0;
 static uint32_t wifi_disconnect_since_ms = 0;
@@ -28,6 +31,9 @@ static uint32_t wifi_reconnect_count = 0;
 static uint32_t wifi_retry_count = 0;
 static bool wifi_was_connected = false;
 static bool should_restart_after_reconnect = false;
+static bool setupApActive = false;
+static String wifiSsid = WIFI_SSID;
+static String wifiPassword = WIFI_PASSWORD;
 static ESP8266WebServer webServer(HTTP_PORT);
 static WiFiServer telnetServer(TELNET_PORT);
 static WiFiClient telnetClient;
@@ -50,6 +56,76 @@ static void setRelay(bool on) {
   digitalWrite(RELAY_PIN, on ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
 }
 
+static String htmlEscape(const String &value) {
+  String escaped = value;
+  escaped.replace("&", "&amp;");
+  escaped.replace("<", "&lt;");
+  escaped.replace(">", "&gt;");
+  escaped.replace("\"", "&quot;");
+  return escaped;
+}
+
+static void loadWifiCredentials() {
+  if (!LittleFS.begin()) {
+    logf("LittleFS baslatilamadi, derlenmis Wi-Fi bilgileri kullaniliyor.");
+    return;
+  }
+
+  if (!LittleFS.exists(WIFI_CONFIG_FILE)) {
+    return;
+  }
+
+  File file = LittleFS.open(WIFI_CONFIG_FILE, "r");
+  if (!file) {
+    return;
+  }
+
+  wifiSsid = file.readStringUntil('\n');
+  wifiSsid.trim();
+  wifiPassword = file.readStringUntil('\n');
+  wifiPassword.trim();
+  file.close();
+
+  if (wifiSsid.length() == 0) {
+    wifiSsid = WIFI_SSID;
+    wifiPassword = WIFI_PASSWORD;
+  }
+}
+
+static bool saveWifiCredentials(const String &ssid, const String &password) {
+  File file = LittleFS.open(WIFI_CONFIG_FILE, "w");
+  if (!file) {
+    return false;
+  }
+
+  file.println(ssid);
+  file.println(password);
+  file.close();
+  wifiSsid = ssid;
+  wifiPassword = password;
+  return true;
+}
+
+static void startSetupAccessPoint() {
+  if (setupApActive) {
+    return;
+  }
+
+  WiFi.softAP(WIFI_SETUP_AP);
+  setupApActive = true;
+  logf("Setup AP aktif: %s / http://192.168.4.1/setup", WIFI_SETUP_AP);
+}
+
+static void stopSetupAccessPoint() {
+  if (!setupApActive) {
+    return;
+  }
+
+  WiFi.softAPdisconnect(true);
+  setupApActive = false;
+  logf("Setup AP kapatildi.");
+}
+
 static void setSwitchState(bool on, bool notifyHomeKit) {
   cha_switch_on.value.bool_value = on;
   setRelay(on);
@@ -60,15 +136,16 @@ static void setSwitchState(bool on, bool notifyHomeKit) {
   }
 }
 
-static void connectWifi() {
-  WiFi.mode(WIFI_STA);
+static bool connectWifi() {
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
   WiFi.hostname("wemos-role");
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  startSetupAccessPoint();
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 
-  logf("Wi-Fi baglaniyor: %s", WIFI_SSID);
+  logf("Wi-Fi baglaniyor: %s", wifiSsid.c_str());
 
   uint8_t attempts = 0;
   while (WiFi.status() != WL_CONNECTED) {
@@ -76,18 +153,20 @@ static void connectWifi() {
     Serial.print(".");
     attempts++;
 
-    if (attempts >= 120) {
-      logf("Wi-Fi baglantisi kurulamadigi icin yeniden baslatiliyor.");
-      ESP.restart();
+    if (attempts >= 40) {
+      logf("Wi-Fi baglantisi kurulamadi. Setup AP acik kalacak.");
+      return false;
     }
   }
 
   logf("Wi-Fi baglandi. IP: %s", WiFi.localIP().toString().c_str());
+  stopSetupAccessPoint();
   wifi_was_connected = true;
   wifi_disconnect_since_ms = 0;
   next_wifi_retry_ms = 0;
   wifi_recovered_at_ms = 0;
   should_restart_after_reconnect = false;
+  return true;
 }
 
 void switchSetter(const homekit_value_t value) {
@@ -98,6 +177,74 @@ void switchSetter(const homekit_value_t value) {
 static void setupHomeKit() {
   cha_switch_on.setter = switchSetter;
   arduino_homekit_setup(&config);
+}
+
+static void handleSetupPage() {
+  int networkCount = WiFi.scanComplete();
+  if (networkCount == WIFI_SCAN_FAILED || networkCount == WIFI_SCAN_RUNNING) {
+    WiFi.scanNetworks(true, true);
+    networkCount = 0;
+  }
+
+  String body;
+  body.reserve(4096);
+  body += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  body += "<title>Wemos Setup</title><style>";
+  body += "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;background:#f6f7f8;color:#111}";
+  body += "form,section{background:#fff;padding:16px 18px;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.06);margin-bottom:16px}";
+  body += "input,select,button{width:100%;padding:12px;margin:8px 0;border:1px solid #d0d7de;border-radius:8px;font-size:16px}";
+  body += "button{background:#111;color:#fff;border:none}";
+  body += "small{color:#666} ul{padding-left:18px}";
+  body += "</style></head><body>";
+  body += "<h1>Wemos Wi-Fi Kurulumu</h1>";
+  body += "<section><strong>Setup AP:</strong> ";
+  body += WIFI_SETUP_AP;
+  body += "<br><small>Bu sayfa cihaz mevcut ağa bağlanamadığında açılır.</small></section>";
+  body += "<form method='POST' action='/setup'>";
+  body += "<label>SSID</label>";
+  body += "<input name='ssid' list='ssid-list' value='" + htmlEscape(wifiSsid) + "' required>";
+  body += "<datalist id='ssid-list'>";
+  for (int i = 0; i < networkCount; i++) {
+    body += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
+  }
+  body += "</datalist>";
+  body += "<label>Sifre</label>";
+  body += "<input name='password' type='password' value='" + htmlEscape(wifiPassword) + "'>";
+  body += "<button type='submit'>Kaydet ve Yeniden Baslat</button>";
+  body += "</form>";
+  body += "<section><h2>Yakin Aglar</h2><ul>";
+  for (int i = 0; i < networkCount; i++) {
+    body += "<li>";
+    body += htmlEscape(WiFi.SSID(i));
+    body += " (RSSI ";
+    body += String(WiFi.RSSI(i));
+    body += ", kanal ";
+    body += String(WiFi.channel(i));
+    body += WiFi.encryptionType(i) == ENC_TYPE_NONE ? ", acik" : ", sifreli";
+    body += ")</li>";
+  }
+  body += "</ul></section></body></html>";
+  webServer.send(200, "text/html; charset=utf-8", body);
+}
+
+static void handleSetupSave() {
+  const String ssid = webServer.arg("ssid");
+  const String password = webServer.arg("password");
+
+  if (ssid.length() == 0) {
+    webServer.send(400, "text/plain", "SSID zorunlu.");
+    return;
+  }
+
+  if (!saveWifiCredentials(ssid, password)) {
+    webServer.send(500, "text/plain", "Wi-Fi bilgileri kaydedilemedi.");
+    return;
+  }
+
+  webServer.send(200, "text/html; charset=utf-8",
+                 "<html><body><h1>Kaydedildi</h1><p>Cihaz yeniden baslatiliyor...</p></body></html>");
+  delay(1000);
+  ESP.restart();
 }
 
 static void handleRoot() {
@@ -115,7 +262,7 @@ static void handleRoot() {
   body += "},";
   body += "\"network\":{";
   body += "\"hostname\":\"wemos-role\",";
-  body += "\"wifi_ssid\":\"" + String(WIFI_SSID) + "\",";
+  body += "\"wifi_ssid\":\"" + wifiSsid + "\",";
   body += "\"status\":" + String(WiFi.status()) + ",";
   body += "\"connected\":";
   body += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
@@ -156,6 +303,9 @@ static void handleRoot() {
   body += "},";
   body += "\"services\":{";
   body += "\"http\":\"http://" + WiFi.localIP().toString() + "/\",";
+  body += "\"setup\":\"";
+  body += (WiFi.status() == WL_CONNECTED) ? "http://" + WiFi.localIP().toString() + "/setup" : "http://192.168.4.1/setup";
+  body += "\",";
   body += "\"telnet\":\"telnet " + WiFi.localIP().toString() + " 23\",";
   body += "\"ota_host\":\"wemos-role.local\"";
   body += "}";
@@ -165,8 +315,10 @@ static void handleRoot() {
 
 static void setupWebServer() {
   webServer.on("/", handleRoot);
+  webServer.on("/setup", HTTP_GET, handleSetupPage);
+  webServer.on("/setup", HTTP_POST, handleSetupSave);
   webServer.begin();
-  logf("HTTP durum sayfasi hazir: http://%s/", WiFi.localIP().toString().c_str());
+  logf("HTTP hazir: http://%s/", WiFi.localIP().toString().c_str());
 }
 
 static void setupOta() {
@@ -235,7 +387,7 @@ static void handleWifiReconnect() {
   if (now >= next_wifi_retry_ms) {
     WiFi.disconnect(false);
     delay(100);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
     next_wifi_retry_ms = now + 10000;
     wifi_retry_count++;
     logf("Wi-Fi yeniden baglanma denemesi baslatildi.");
@@ -257,10 +409,16 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   setRelay(false);
 
-  connectWifi();
-  setupOta();
+  loadWifiCredentials();
+  const bool wifiConnected = connectWifi();
+
   setupWebServer();
-  setupHomeKit();
+  if (wifiConnected) {
+    setupOta();
+    setupHomeKit();
+  } else {
+    WiFi.scanNetworks(true, true);
+  }
 
   logf("HomeKit hazir. Eslesme kodu: 111-11-111");
 }
@@ -268,9 +426,11 @@ void setup() {
 void loop() {
   handleWifiReconnect();
   handleTelnet();
-  ArduinoOTA.handle();
   webServer.handleClient();
-  arduino_homekit_loop();
+  if (WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.handle();
+    arduino_homekit_loop();
+  }
   delay(10);
 
   const uint32_t now = millis();
