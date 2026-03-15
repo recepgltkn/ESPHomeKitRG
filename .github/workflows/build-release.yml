@@ -1,4 +1,4 @@
-name: Build And Publish Firmware
+name: Build Firmware
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -47,14 +47,12 @@ jobs:
             "version": "${SHORT_SHA}",
             "commit": "${BUILD_VERSION}",
             "built_at": "${BUILD_TIME}",
-            "bin_url": "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/firmware.bin"
+            "bin_url": "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/main/docs/latest/firmware.bin"
           }
           EOF
 
-      - name: Publish To gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload Firmware Bundle Artifact
+        uses: actions/upload-artifact@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: ./release
-          keep_files: true
+          name: firmware-bundle
+          path: release/latest

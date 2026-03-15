@@ -138,7 +138,7 @@ Su anki durum:
 Manifest adresi:
 
 ```text
-https://recepgltkn.github.io/ESPHomeKitRG/latest/version.json
+https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/main/docs/latest/version.json
 ```
 
 ## Wi-Fi Kurulum Modu

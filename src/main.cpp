@@ -40,12 +40,13 @@ extern homekit_characteristic_t cha_light_level;
 #define TELNET_PORT 23
 #define WIFI_CONFIG_FILE "/wifi.txt"
 #define SENSOR_CONFIG_FILE "/config.txt"
-#define WIFI_SETUP_AP "Wemos-Setup"
+#define WIFI_SETUP_AP_PREFIX "Wemos-Setup"
+#define WIFI_SETUP_PASSWORD "12345678"
 #define APP_NAME "Wemos Role"
 #define STATUS_REFRESH_MS 3000UL
 #define UPDATE_CHECK_INTERVAL_MS 60000UL
 #define AUTO_UPDATE_ENABLED false
-#define UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/version.json"
+#define UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/main/docs/latest/version.json"
 #define HOMEKIT_RECOVERY_IDLE_MS 180000UL
 #define HOMEKIT_RECOVERY_GRACE_MS 120000UL
 #define HOMEKIT_RECOVERY_COOLDOWN_MS 600000UL
@@ -98,6 +99,7 @@ static char deviceName[32] = APP_NAME;
 static char otaHostname[32] = "wemos-role";
 static char serialNumber[32] = "WEMOS-D1-R2-RELAY";
 static char firmwareRevision[16] = APP_VERSION;
+static char setupApName[32] = WIFI_SETUP_AP_PREFIX;
 static ESP8266WebServer webServer(HTTP_PORT);
 static WiFiServer telnetServer(TELNET_PORT);
 static WiFiClient telnetClient;
@@ -141,6 +143,7 @@ static void prepareDeviceIdentity() {
   snprintf(otaHostname, sizeof(otaHostname), "wemos-role-%06lx", chipId);
   snprintf(serialNumber, sizeof(serialNumber), "WEMOS-%06lX", chipId);
   snprintf(firmwareRevision, sizeof(firmwareRevision), "%s", APP_VERSION);
+  snprintf(setupApName, sizeof(setupApName), "%s-%06lX", WIFI_SETUP_AP_PREFIX, chipId);
 
   cha_name.value.format = homekit_format_string;
   cha_name.value.string_value = deviceName;
@@ -573,9 +576,9 @@ static void startSetupAccessPoint() {
     return;
   }
 
-  WiFi.softAP(WIFI_SETUP_AP);
+  WiFi.softAP(setupApName, WIFI_SETUP_PASSWORD, 1, false);
   setupApActive = true;
-  logf("Setup AP aktif: %s / http://192.168.4.1/setup", WIFI_SETUP_AP);
+  logf("Setup AP aktif: %s / http://192.168.4.1/setup", setupApName);
 }
 
 static void stopSetupAccessPoint() {
@@ -990,8 +993,10 @@ static void handleSetupPage() {
   body += "</style></head><body>";
   body += "<h1>Wemos Wi-Fi Kurulumu</h1>";
   body += "<section><strong>Setup AP:</strong> ";
-  body += WIFI_SETUP_AP;
-  body += "<br><small>Bu sayfa cihaz mevcut ağa bağlanamadığında açılır.</small></section>";
+  body += setupApName;
+  body += "<br><small>Sifre: ";
+  body += WIFI_SETUP_PASSWORD;
+  body += "</small><br><small>Bu sayfa cihaz mevcut ağa bağlanamadığında açılır.</small></section>";
   body += "<form method='POST' action='/setup'>";
   body += "<label>SSID</label>";
   body += "<input name='ssid' list='ssid-list' value='" + htmlEscape(wifiSsid) + "' required>";
