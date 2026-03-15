@@ -6,49 +6,67 @@ Bu proje ile:
 
 - roleyi iPhone `Home` uygulamasina dogrudan ekleyebilirsiniz
 - roleyi HomeKit uzerinden acip kapatabilirsiniz
+- ayni cihazda sicaklik, nem, hareket ve isik sensorlerini HomeKit'e ekleyebilirsiniz
+- fiziksel buton ile roleyi acip kapatabilirsiniz
 - cihazi USB baglamadan OTA ile guncelleyebilirsiniz
-- GitHub'daki yeni firmware'i her dakika kontrol edip otomatik kurabilirsiniz
 - cihaz durumunu HTTP uzerinden gorebilirsiniz
 - canli bir durum panelini sayfa yenilemeden izleyebilirsiniz
 - loglari Telnet uzerinden izleyebilirsiniz
 - yeni bir eve goturdugunuzde Wi-Fi ayarlarini web arayuzunden degistirebilirsiniz
+- sensor ve buton davranislarini `/config` altindan ayarlayabilirsiniz
 
 ## Donanim
 
 - Wemos D1 Mini R2 veya uyumlu ESP8266 kart
 - Wemos uyumlu relay modulu veya `D1/GPIO5` uzerinden surulen bir role
+- `DHT22` sicaklik/nem sensoru
+- dijital cikisli `PIR` hareket sensoru
+- `A0` ile kullanilan LDR bolucu devresi
+- `D2` uzerinden GND'ye baglanan anlik buton
 - 5V uygun besleme
 
-Varsayilan role pini:
+Varsayilan pin plani:
 
-- `D1 / GPIO5`
+- `D1 / GPIO5`: role
+- `D2 / GPIO4`: buton
+- `D5 / GPIO14`: PIR
+- `D6 / GPIO12`: DHT22
+- `A0`: LDR
 
 Kodda role aktif seviyesi:
 
-- `LOW = role acik`
-- `HIGH = role kapali`
+- `HIGH = role acik`
+- `LOW = role kapali`
 
 Eger kullandiginiz role karti ters lojik ile calisiyorsa `src/main.cpp` icindeki aktif/pasif seviye sabitlerini degistirin.
+
+Baglanti notlari:
+
+- buton bir ucu `D2`, diger ucu `GND`
+- PIR cikisi `D5`, besleme ve GND ortak
+- DHT22 data `D6`, besleme ve GND ortak
+- LDR dogrudan baglanmaz; `A0` icin uygun gerilim bolucu ile kullanilmalidir
+- `A0` pinine `3.3V` ustu gerilim verilmemelidir
 
 ## Ozellikler
 
 - Native HomeKit accessory olarak calisir
-- Home app uzerinden `Switch` aksesuar tipinde gorunur
+- Home app uzerinden tek cihaz altinda `Switch`, `Temperature`, `Humidity`, `Motion` ve `Light` servisleri gorunur
 - Wi-Fi koparsa yeniden baglanmayi dener
 - Wi-Fi geri geldiginde HomeKit tarafini temiz toparlamak icin kontrollu restart uygular
 - `ArduinoOTA` ile kablosuz firmware guncelleme destekler
 - HTTP JSON status endpoint sunar
 - `/status` altinda canli durum paneli sunar
+- `/config` altinda kalici sensor ayar sayfasi sunar
 - Telnet log portu sunar
 - Wi-Fi kurulum sayfasi sunar
 - mevcut ağa baglanamazsa kendi setup access point'ini acar
-- GitHub `gh-pages` uzerindeki manifest dosyasini her 60 saniyede bir kontrol eder
-- yeni surum bulursa firmware'i otomatik indirip kurar
+- HomeKit istemcisi uzun sure kaybolursa kontrollu toparlama restarti uygular
 
 ## Proje Yapisi
 
-- `src/main.cpp`: ana firmware, Wi-Fi, HomeKit, OTA, HTTP, Telnet
-- `src/my_accessory.c`: HomeKit accessory tanimi
+- `src/main.cpp`: ana firmware, Wi-Fi, HomeKit, OTA, HTTP, Telnet, sensorler, buton, config
+- `src/my_accessory.c`: HomeKit accessory ve sensor service tanimlari
 - `include/wifi_info.h`: Wi-Fi bilgileri
 - `platformio.ini`: PlatformIO ortami
 
@@ -104,29 +122,24 @@ Cihaz agda calisiyorsa USB olmadan guncelleme yapabilirsiniz:
 
 PlatformIO IP adresi gordugunde otomatik olarak `espota` kullanir.
 
-## Otomatik GitHub Guncelleme
+## Firmware Update Yapisi
 
-Bu proje GitHub'a push edilen yeni firmware'i otomatik alacak sekilde hazirlanmistir.
+Bu projede iki ayri update yolu vardir:
 
-Akis:
+- klasik `ArduinoOTA` aktif
+- Git tabanli self-update arayuzu mevcut ama otomatik kurulum kapali
 
-- `main` branch'e push yaparsiniz
-- GitHub Actions firmware'i derler
-- `gh-pages/latest/firmware.bin` ve `gh-pages/latest/version.json` dosyalarini yayinlar
-- cihaz bu manifest'i her `60 saniyede` bir kontrol eder
-- yeni surum bulursa otomatik OTA guncelleme yapar
+Su anki durum:
+
+- `pio run -t upload --upload-port <ip>` ile OTA yukleme kullanilabilir
+- `/update` sayfasi manuel kontrol/yukleme arayuzu sunar
+- GitHub tabanli otomatik self-update varsayilan olarak kapalidir
 
 Manifest adresi:
 
 ```text
 https://recepgltkn.github.io/ESPHomeKitRG/latest/version.json
 ```
-
-Not:
-
-- ilk manifest ancak workflow bir kez calistiktan sonra olusur
-- cihaz JSON icinde son update kontrol sonucunu da gosterir
-- otomatik guncelleme sirasinda cihaz kendini yeniden baslatir
 
 ## Wi-Fi Kurulum Modu
 
@@ -197,6 +210,8 @@ JSON olarak su bilgileri doner:
 - Wi-Fi reconnect sayaçlari
 - setup endpoint bilgisi
 - role durumu
+- sensor olcumleri
+- config degerleri
 - HomeKit istemci sayisi
 - uptime
 - heap ve bellek parcaciklanmasi
@@ -249,7 +264,7 @@ http://192.168.68.101/status
 Bu sayfa:
 
 - 3 saniyede bir otomatik yenilenir
-- role, Wi-Fi, RSSI, heap ve surum bilgisini gosterir
+- role, Wi-Fi, RSSI, heap, sicaklik, nem, PIR ve isik bilgisini gosterir
 - update durumunu ve bir sonraki kontrol zamanini gosterir
 - ag, sistem ve servis detaylarini canli olarak listeler
 
@@ -258,6 +273,49 @@ Ham JSON:
 ```text
 http://192.168.68.101/api/status
 ```
+
+## Config Ekrani
+
+Tarayicidan:
+
+```text
+http://192.168.68.101/config
+```
+
+Bu sayfadan su ayarlar degistirilebilir:
+
+- `LDR threshold`
+- `LDR hysteresis`
+- `PIR hold ms`
+- `PIR cooldown ms`
+- `temperature offset`
+- `humidity offset`
+- `button debounce ms`
+
+Ayarlar `LittleFS` icinde saklanir ve yeniden baslatma sonrasi korunur.
+
+## HomeKit Sensor Destegi
+
+Bu firmware tek bir Wemos D1 Mini uzerinde ayni anda su HomeKit servislerini sunar:
+
+- `Switch`
+- `Temperature Sensor`
+- `Humidity Sensor`
+- `Motion Sensor`
+- `Light Sensor`
+
+Yani ayni aksesuar altinda hem role hem de DHT/PIR/LDR verileri Home uygulamasinda kullanilabilir.
+
+## Buton Davranisi
+
+`D2` pinine baglanan fiziksel buton `INPUT_PULLUP` ile okunur.
+
+Butona basildiginda:
+
+- role toggle olur
+- HomeKit switch durumu aninda guncellenir
+
+Buton debounce suresi `/config` altindan ayarlanabilir.
 
 ## Varsayilan Ag Servisleri
 

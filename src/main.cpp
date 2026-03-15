@@ -5,6 +5,7 @@
 #include <ArduinoOTA.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <Updater.h>
+#include <DHTesp.h>
 #include <arduino_homekit_server.h>
 #include <user_interface.h>
 #include "wifi_info.h"
@@ -21,15 +22,24 @@ extern homekit_characteristic_t cha_name;
 extern homekit_characteristic_t cha_accessory_name;
 extern homekit_characteristic_t cha_serial_number;
 extern homekit_characteristic_t cha_firmware_revision;
+extern homekit_characteristic_t cha_temperature;
+extern homekit_characteristic_t cha_humidity;
+extern homekit_characteristic_t cha_motion_detected;
+extern homekit_characteristic_t cha_light_level;
 }
 
 #define SERIAL_BAUD 115200
 #define RELAY_PIN D1
 #define RELAY_ACTIVE_LEVEL HIGH
 #define RELAY_INACTIVE_LEVEL LOW
+#define BUTTON_PIN D2
+#define PIR_PIN D5
+#define DHT_PIN D6
+#define LDR_PIN A0
 #define HTTP_PORT 80
 #define TELNET_PORT 23
 #define WIFI_CONFIG_FILE "/wifi.txt"
+#define SENSOR_CONFIG_FILE "/config.txt"
 #define WIFI_SETUP_AP "Wemos-Setup"
 #define APP_NAME "Wemos Role"
 #define STATUS_REFRESH_MS 3000UL
@@ -39,6 +49,17 @@ extern homekit_characteristic_t cha_firmware_revision;
 #define HOMEKIT_RECOVERY_IDLE_MS 180000UL
 #define HOMEKIT_RECOVERY_GRACE_MS 120000UL
 #define HOMEKIT_RECOVERY_COOLDOWN_MS 600000UL
+#define SENSOR_READ_INTERVAL_MS 5000UL
+
+struct SensorConfig {
+  uint16_t ldr_threshold;
+  uint16_t ldr_hysteresis;
+  uint32_t pir_hold_ms;
+  uint16_t pir_cooldown_ms;
+  int8_t temperature_offset_tenths;
+  int8_t humidity_offset_tenths;
+  uint16_t button_debounce_ms;
+};
 
 static uint32_t next_status_log_ms = 0;
 static uint32_t wifi_disconnect_since_ms = 0;
@@ -64,8 +85,15 @@ static bool updateAvailable = false;
 static uint32_t lastSuccessfulUpdateCheckMs = 0;
 static uint32_t homekitLastClientSeenMs = 0;
 static uint32_t homekitLastRecoveryRestartMs = 0;
+static uint32_t lastSensorReadMs = 0;
+static uint32_t lastButtonToggleMs = 0;
+static uint32_t pirLastMotionMs = 0;
+static uint32_t pirLastTransitionMs = 0;
 static bool homekitEverHadClient = false;
 static bool homekitRecoveryPending = false;
+static bool buttonPressed = false;
+static bool pirMotionState = false;
+static bool ldrDarkState = false;
 static char deviceName[32] = APP_NAME;
 static char otaHostname[32] = "wemos-role";
 static char serialNumber[32] = "WEMOS-D1-R2-RELAY";
@@ -73,6 +101,21 @@ static char firmwareRevision[16] = APP_VERSION;
 static ESP8266WebServer webServer(HTTP_PORT);
 static WiFiServer telnetServer(TELNET_PORT);
 static WiFiClient telnetClient;
+static DHTesp dht;
+static SensorConfig sensorConfig = {
+  550,
+  40,
+  30000,
+  2500,
+  0,
+  0,
+  250
+};
+static float lastTemperatureC = 20.0f;
+static float lastHumidityPct = 50.0f;
+static uint16_t lastLdrRaw = 0;
+static float lastLux = 10.0f;
+static void setSwitchState(bool on, bool notifyHomeKit);
 
 static void logf(const char *fmt, ...) {
   char buffer[256];
@@ -188,6 +231,42 @@ static String extractJsonValue(const String &json, const String &key) {
   }
 
   return json.substring(valueStart, valueEnd);
+}
+
+static uint16_t clampU16(long value, uint16_t minValue, uint16_t maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return static_cast<uint16_t>(value);
+}
+
+static uint32_t clampU32(long value, uint32_t minValue, uint32_t maxValue) {
+  if (value < static_cast<long>(minValue)) {
+    return minValue;
+  }
+  if (value > static_cast<long>(maxValue)) {
+    return maxValue;
+  }
+  return static_cast<uint32_t>(value);
+}
+
+static int8_t clampI8(long value, int8_t minValue, int8_t maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return static_cast<int8_t>(value);
+}
+
+static String readConfigLine(File &file) {
+  String line = file.readStringUntil('\n');
+  line.trim();
+  return line;
 }
 
 static bool parseHttpsUrl(const String &url, String &host, uint16_t &port, String &path) {
@@ -448,6 +527,47 @@ static bool saveWifiCredentials(const String &ssid, const String &password) {
   return true;
 }
 
+static void loadSensorConfig() {
+  if (!LittleFS.begin()) {
+    return;
+  }
+
+  if (!LittleFS.exists(SENSOR_CONFIG_FILE)) {
+    return;
+  }
+
+  File file = LittleFS.open(SENSOR_CONFIG_FILE, "r");
+  if (!file) {
+    return;
+  }
+
+  sensorConfig.ldr_threshold = clampU16(readConfigLine(file).toInt(), 0, 1023);
+  sensorConfig.ldr_hysteresis = clampU16(readConfigLine(file).toInt(), 0, 400);
+  sensorConfig.pir_hold_ms = clampU32(readConfigLine(file).toInt(), 1000, 120000);
+  sensorConfig.pir_cooldown_ms = clampU16(readConfigLine(file).toInt(), 100, 30000);
+  sensorConfig.temperature_offset_tenths = clampI8(readConfigLine(file).toInt(), -100, 100);
+  sensorConfig.humidity_offset_tenths = clampI8(readConfigLine(file).toInt(), -100, 100);
+  sensorConfig.button_debounce_ms = clampU16(readConfigLine(file).toInt(), 50, 2000);
+  file.close();
+}
+
+static bool saveSensorConfig() {
+  File file = LittleFS.open(SENSOR_CONFIG_FILE, "w");
+  if (!file) {
+    return false;
+  }
+
+  file.println(sensorConfig.ldr_threshold);
+  file.println(sensorConfig.ldr_hysteresis);
+  file.println(sensorConfig.pir_hold_ms);
+  file.println(sensorConfig.pir_cooldown_ms);
+  file.println(sensorConfig.temperature_offset_tenths);
+  file.println(sensorConfig.humidity_offset_tenths);
+  file.println(sensorConfig.button_debounce_ms);
+  file.close();
+  return true;
+}
+
 static void startSetupAccessPoint() {
   if (setupApActive) {
     return;
@@ -466,6 +586,135 @@ static void stopSetupAccessPoint() {
   WiFi.softAPdisconnect(true);
   setupApActive = false;
   logf("Setup AP kapatildi.");
+}
+
+static float clampFloatValue(float value, float minValue, float maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
+}
+
+static float ldrRawToLux(const uint16_t raw) {
+  const float ratio = static_cast<float>(raw) / 1023.0f;
+  const float lux = 0.1f + (ratio * ratio * 9999.9f);
+  return clampFloatValue(lux, 0.1f, 10000.0f);
+}
+
+static void updateLightState(const uint16_t rawValue, const bool notifyHomeKit) {
+  lastLdrRaw = rawValue;
+  lastLux = ldrRawToLux(rawValue);
+
+  const uint16_t darkOn = sensorConfig.ldr_threshold;
+  const uint16_t darkOff = darkOn > sensorConfig.ldr_hysteresis
+    ? darkOn - sensorConfig.ldr_hysteresis
+    : 0;
+
+  if (!ldrDarkState && rawValue >= darkOn) {
+    ldrDarkState = true;
+  } else if (ldrDarkState && rawValue <= darkOff) {
+    ldrDarkState = false;
+  }
+
+  if (fabsf(cha_light_level.value.float_value - lastLux) >= 0.5f) {
+    cha_light_level.value.float_value = lastLux;
+    if (notifyHomeKit) {
+      homekit_characteristic_notify(&cha_light_level, cha_light_level.value);
+    }
+  }
+}
+
+static void updateMotionState(const bool motionDetected, const bool notifyHomeKit) {
+  if (pirMotionState == motionDetected) {
+    return;
+  }
+
+  pirMotionState = motionDetected;
+  cha_motion_detected.value.bool_value = motionDetected;
+  logf("PIR durumu: %s", motionDetected ? "HAREKET" : "BOS");
+
+  if (notifyHomeKit) {
+    homekit_characteristic_notify(&cha_motion_detected, cha_motion_detected.value);
+  }
+}
+
+static void updateClimateState(const float temperatureC, const float humidityPct, const bool notifyHomeKit) {
+  const float clampedTemperature = clampFloatValue(temperatureC, -40.0f, 100.0f);
+  const float clampedHumidity = clampFloatValue(humidityPct, 0.0f, 100.0f);
+
+  if (fabsf(cha_temperature.value.float_value - clampedTemperature) >= 0.1f) {
+    cha_temperature.value.float_value = clampedTemperature;
+    if (notifyHomeKit) {
+      homekit_characteristic_notify(&cha_temperature, cha_temperature.value);
+    }
+  }
+
+  if (fabsf(cha_humidity.value.float_value - clampedHumidity) >= 0.5f) {
+    cha_humidity.value.float_value = clampedHumidity;
+    if (notifyHomeKit) {
+      homekit_characteristic_notify(&cha_humidity, cha_humidity.value);
+    }
+  }
+
+  lastTemperatureC = clampedTemperature;
+  lastHumidityPct = clampedHumidity;
+}
+
+static void toggleRelayFromButton() {
+  setSwitchState(!cha_switch_on.value.bool_value, true);
+}
+
+static void readSensors() {
+  const uint32_t now = millis();
+  if (now - lastSensorReadMs < SENSOR_READ_INTERVAL_MS) {
+    return;
+  }
+  lastSensorReadMs = now;
+
+  TempAndHumidity climate = dht.getTempAndHumidity();
+  if (!isnan(climate.temperature) && !isnan(climate.humidity)) {
+    const float adjustedTemperature = climate.temperature + (sensorConfig.temperature_offset_tenths / 10.0f);
+    const float adjustedHumidity = climate.humidity + (sensorConfig.humidity_offset_tenths / 10.0f);
+    updateClimateState(adjustedTemperature, adjustedHumidity, true);
+  }
+
+  updateLightState(analogRead(LDR_PIN), true);
+}
+
+static void handlePirInput() {
+  const uint32_t now = millis();
+  const bool pirSignal = digitalRead(PIR_PIN) == HIGH;
+
+  if (pirSignal) {
+    pirLastMotionMs = now;
+    if (!pirMotionState && now - pirLastTransitionMs >= sensorConfig.pir_cooldown_ms) {
+      pirLastTransitionMs = now;
+      updateMotionState(true, true);
+    }
+    return;
+  }
+
+  if (pirMotionState && pirLastMotionMs != 0 && now - pirLastMotionMs >= sensorConfig.pir_hold_ms) {
+    pirLastTransitionMs = now;
+    updateMotionState(false, true);
+  }
+}
+
+static void handleButtonInput() {
+  const bool pressedNow = digitalRead(BUTTON_PIN) == LOW;
+  const uint32_t now = millis();
+
+  if (pressedNow && !buttonPressed && now - lastButtonToggleMs >= sensorConfig.button_debounce_ms) {
+    buttonPressed = true;
+    lastButtonToggleMs = now;
+    logf("Buton tetiklendi.");
+    toggleRelayFromButton();
+  } else if (!pressedNow) {
+    buttonPressed = false;
+  }
 }
 
 static String buildStatusJson() {
@@ -510,6 +759,28 @@ static String buildStatusJson() {
   body += cha_switch_on.value.bool_value ? "true" : "false";
   body += ",";
   body += "\"gpio\":" + String(RELAY_PIN);
+  body += "},";
+  body += "\"sensors\":{";
+  body += "\"temperature_c\":" + String(lastTemperatureC, 1) + ",";
+  body += "\"humidity_pct\":" + String(lastHumidityPct, 1) + ",";
+  body += "\"motion\":";
+  body += pirMotionState ? "true" : "false";
+  body += ",";
+  body += "\"ldr_raw\":" + String(lastLdrRaw) + ",";
+  body += "\"ldr_dark\":";
+  body += ldrDarkState ? "true" : "false";
+  body += ",";
+  body += "\"light_lux\":" + String(lastLux, 1);
+  body += "},";
+  body += "\"config\":{";
+  body += "\"pins\":{\"relay\":\"D1\",\"button\":\"D2\",\"pir\":\"D5\",\"dht\":\"D6\",\"ldr\":\"A0\"},";
+  body += "\"ldr_threshold\":" + String(sensorConfig.ldr_threshold) + ",";
+  body += "\"ldr_hysteresis\":" + String(sensorConfig.ldr_hysteresis) + ",";
+  body += "\"pir_hold_ms\":" + String(sensorConfig.pir_hold_ms) + ",";
+  body += "\"pir_cooldown_ms\":" + String(sensorConfig.pir_cooldown_ms) + ",";
+  body += "\"temperature_offset_c\":" + String(sensorConfig.temperature_offset_tenths / 10.0f, 1) + ",";
+  body += "\"humidity_offset_pct\":" + String(sensorConfig.humidity_offset_tenths / 10.0f, 1) + ",";
+  body += "\"button_debounce_ms\":" + String(sensorConfig.button_debounce_ms);
   body += "},";
   body += "\"homekit\":{";
   body += "\"clients\":" + String(arduino_homekit_connected_clients_count()) + ",";
@@ -560,6 +831,7 @@ static String buildStatusJson() {
   body += "\"http\":\"http://" + WiFi.localIP().toString() + "/\",";
   body += "\"status\":\"http://" + WiFi.localIP().toString() + "/status\",";
   body += "\"api_status\":\"http://" + WiFi.localIP().toString() + "/api/status\",";
+  body += "\"config\":\"http://" + WiFi.localIP().toString() + "/config\",";
   body += "\"setup\":\"";
   body += (WiFi.status() == WL_CONNECTED) ? "http://" + WiFi.localIP().toString() + "/setup" : "http://192.168.4.1/setup";
   body += "\",";
@@ -767,6 +1039,52 @@ static void handleSetupSave() {
   ESP.restart();
 }
 
+static void handleConfigPage() {
+  String body;
+  body.reserve(5000);
+  body += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  body += "<title>Wemos Config</title><style>";
+  body += "body{font-family:Georgia,serif;max-width:820px;margin:32px auto;padding:0 16px;background:#f3efe7;color:#171512}";
+  body += "form,section{background:#fffdf8;padding:18px;border-radius:16px;border:1px solid #ddd5c7;box-shadow:0 10px 28px rgba(0,0,0,.05);margin-bottom:16px}";
+  body += "label{display:block;font-size:14px;margin-top:10px} input,button{width:100%;padding:12px;margin-top:6px;border-radius:10px;border:1px solid #cfc6b6;font-size:16px}";
+  body += "button{background:#171512;color:#fff;border:none} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}";
+  body += "small{color:#6a635a}";
+  body += "</style></head><body>";
+  body += "<h1>/config</h1>";
+  body += "<section><strong>Pinler</strong><br><small>Role=D1, Buton=D2, PIR=D5, DHT=D6, LDR=A0</small></section>";
+  body += "<form method='POST' action='/config'>";
+  body += "<div class='grid'>";
+  body += "<label>LDR esik (0-1023)<input name='ldr_threshold' type='number' min='0' max='1023' value='" + String(sensorConfig.ldr_threshold) + "'></label>";
+  body += "<label>LDR histerezis<input name='ldr_hysteresis' type='number' min='0' max='400' value='" + String(sensorConfig.ldr_hysteresis) + "'></label>";
+  body += "<label>PIR aktif tutma ms<input name='pir_hold_ms' type='number' min='1000' max='120000' value='" + String(sensorConfig.pir_hold_ms) + "'></label>";
+  body += "<label>PIR cooldown ms<input name='pir_cooldown_ms' type='number' min='100' max='30000' value='" + String(sensorConfig.pir_cooldown_ms) + "'></label>";
+  body += "<label>Sicaklik offset (0.1C)<input name='temperature_offset_tenths' type='number' min='-100' max='100' value='" + String(sensorConfig.temperature_offset_tenths) + "'></label>";
+  body += "<label>Nem offset (0.1%)<input name='humidity_offset_tenths' type='number' min='-100' max='100' value='" + String(sensorConfig.humidity_offset_tenths) + "'></label>";
+  body += "<label>Buton debounce ms<input name='button_debounce_ms' type='number' min='50' max='2000' value='" + String(sensorConfig.button_debounce_ms) + "'></label>";
+  body += "</div><button type='submit'>Kaydet</button></form>";
+  body += "</body></html>";
+  webServer.send(200, "text/html; charset=utf-8", body);
+}
+
+static void handleConfigSave() {
+  sensorConfig.ldr_threshold = clampU16(webServer.arg("ldr_threshold").toInt(), 0, 1023);
+  sensorConfig.ldr_hysteresis = clampU16(webServer.arg("ldr_hysteresis").toInt(), 0, 400);
+  sensorConfig.pir_hold_ms = clampU32(webServer.arg("pir_hold_ms").toInt(), 1000, 120000);
+  sensorConfig.pir_cooldown_ms = clampU16(webServer.arg("pir_cooldown_ms").toInt(), 100, 30000);
+  sensorConfig.temperature_offset_tenths = clampI8(webServer.arg("temperature_offset_tenths").toInt(), -100, 100);
+  sensorConfig.humidity_offset_tenths = clampI8(webServer.arg("humidity_offset_tenths").toInt(), -100, 100);
+  sensorConfig.button_debounce_ms = clampU16(webServer.arg("button_debounce_ms").toInt(), 50, 2000);
+
+  if (!saveSensorConfig()) {
+    webServer.send(500, "text/plain", "Config kaydedilemedi.");
+    return;
+  }
+
+  updateLightState(analogRead(LDR_PIN), false);
+  webServer.send(200, "text/html; charset=utf-8",
+                 "<html><body><h1>Kaydedildi</h1><p>Ayarlar uygulandi.</p><p><a href='/config'>Geri don</a></p></body></html>");
+}
+
 static void handleRoot() {
   webServer.send(200, "application/json", buildStatusJson());
 }
@@ -795,6 +1113,10 @@ static void handleStatusPage() {
   body += "<div class='card'><div class='label'>Wi-Fi</div><div id='wifi' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>RSSI</div><div id='rssi' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>Heap</div><div id='heap' class='value'>-</div></div>";
+  body += "<div class='card'><div class='label'>Sicaklik</div><div id='temp' class='value'>-</div></div>";
+  body += "<div class='card'><div class='label'>Nem</div><div id='hum' class='value'>-</div></div>";
+  body += "<div class='card'><div class='label'>PIR</div><div id='pir' class='value'>-</div></div>";
+  body += "<div class='card'><div class='label'>Isik</div><div id='ldr' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>Version</div><div id='version' class='value mono'>-</div></div>";
   body += "<div class='card'><div class='label'>Update</div><div id='update' class='value mono'>-</div></div>";
   body += "<div class='card'><div class='label'>Sonraki Kontrol</div><div id='nextCheck' class='value mono'>-</div></div>";
@@ -813,12 +1135,16 @@ static void handleStatusPage() {
   body += "set('wifi',d.network.connected?'BAGLI':'KOPUK',d.network.connected?'good':'warn');";
   body += "set('rssi',`${d.network.rssi} dBm`,d.network.rssi>-70?'good':'warn');";
   body += "set('heap',`${d.system.free_heap} B`,d.system.free_heap>20000?'good':'warn');";
+  body += "set('temp',`${d.sensors.temperature_c} C`,d.sensors.temperature_c<35?'good':'warn');";
+  body += "set('hum',`${d.sensors.humidity_pct} %`,d.sensors.humidity_pct<75?'good':'warn');";
+  body += "set('pir',d.sensors.motion?'HAREKET':'BOS',d.sensors.motion?'warn':'good');";
+  body += "set('ldr',`${d.sensors.light_lux} lux`,d.sensors.ldr_dark?'warn':'good');";
   body += "set('version',d.update.current_version,'mono');";
   body += "set('update',d.update.in_progress?'YUKLENIYOR':d.update.last_result,'mono');";
   body += "set('nextCheck',`${Math.ceil(d.update.next_check_in_ms/1000)} sn`,'mono');";
   body += "rows('networkRows',[['SSID',d.network.wifi_ssid],['IP',d.network.ip],['BSSID',d.network.bssid],['Kanal',d.network.channel],['RSSI',`${d.network.rssi} dBm`],['Reconnect',d.network.reconnect_count],['Retry',d.network.retry_count],['Setup AP',d.network.setup_ap_active?'ACIK':'KAPALI']]);";
-  body += "rows('systemRows',[['Uptime(ms)',d.system.uptime_ms],['Reset',d.system.reset_reason],['Fragmentation',d.system.heap_fragmentation],['Max block',d.system.max_free_block],['Sketch',d.system.sketch_size],['Clients',d.homekit.clients],['Son istemci',`${Math.floor(d.homekit.last_client_seen_ms_ago/1000)} sn once`],['Recovery',d.homekit.recovery_pending?'BEKLIYOR':'NORMAL'],['Son kontrol',`${Math.floor(d.update.last_check_ms_ago/1000)} sn once`],['Basarili kontrol',`${Math.floor(d.update.last_successful_check_ms_ago/1000)} sn once`]]);";
-  body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Manifest',d.update.manifest_url],['Yeni surum',d.update.last_remote_version||'-']]);";
+  body += "rows('systemRows',[['Uptime(ms)',d.system.uptime_ms],['Reset',d.system.reset_reason],['Fragmentation',d.system.heap_fragmentation],['Max block',d.system.max_free_block],['Sketch',d.system.sketch_size],['Clients',d.homekit.clients],['Son istemci',`${Math.floor(d.homekit.last_client_seen_ms_ago/1000)} sn once`],['Recovery',d.homekit.recovery_pending?'BEKLIYOR':'NORMAL'],['LDR raw',d.sensors.ldr_raw],['Karanlik',d.sensors.ldr_dark?'EVET':'HAYIR']]);";
+  body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Config',d.services.config],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Manifest',d.update.manifest_url],['Yeni surum',d.update.last_remote_version||'-']]);";
   body += "}catch(e){set('update','baglanti hatasi','warn');}} load(); setInterval(load," + String(STATUS_REFRESH_MS) + ");";
   body += "</script></body></html>";
   webServer.send(200, "text/html; charset=utf-8", body);
@@ -924,6 +1250,8 @@ static void setupWebServer() {
   webServer.on("/api/update/install", HTTP_POST, handleUpdateInstall);
   webServer.on("/status", handleStatusPage);
   webServer.on("/update", HTTP_GET, handleUpdatePage);
+  webServer.on("/config", HTTP_GET, handleConfigPage);
+  webServer.on("/config", HTTP_POST, handleConfigSave);
   webServer.on("/setup", HTTP_GET, handleSetupPage);
   webServer.on("/setup", HTTP_POST, handleSetupSave);
   webServer.begin();
@@ -1077,9 +1405,16 @@ void setup() {
   logf("D1 Mini HomeKit role baslatiliyor...");
 
   pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(PIR_PIN, INPUT);
   setRelay(false);
+  dht.setup(DHT_PIN, DHTesp::DHT22);
 
   loadWifiCredentials();
+  loadSensorConfig();
+  updateClimateState(lastTemperatureC, lastHumidityPct, false);
+  updateLightState(analogRead(LDR_PIN), false);
+  updateMotionState(false, false);
   const bool wifiConnected = connectWifi();
 
   setupWebServer();
@@ -1095,6 +1430,9 @@ void setup() {
 
 void loop() {
   handleWifiReconnect();
+  handleButtonInput();
+  handlePirInput();
+  readSensors();
   handleTelnet();
   webServer.handleClient();
   if (WiFi.status() == WL_CONNECTED) {

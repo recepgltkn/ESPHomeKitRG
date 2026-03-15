@@ -10,6 +10,10 @@ homekit_characteristic_t cha_name = HOMEKIT_CHARACTERISTIC_(NAME, "Wemos Role");
 homekit_characteristic_t cha_accessory_name = HOMEKIT_CHARACTERISTIC_(NAME, "Wemos Role");
 homekit_characteristic_t cha_serial_number = HOMEKIT_CHARACTERISTIC_(SERIAL_NUMBER, "WEMOS-D1-R2-RELAY");
 homekit_characteristic_t cha_firmware_revision = HOMEKIT_CHARACTERISTIC_(FIRMWARE_REVISION, "1.0.0");
+homekit_characteristic_t cha_temperature = HOMEKIT_CHARACTERISTIC_(CURRENT_TEMPERATURE, 20.0);
+homekit_characteristic_t cha_humidity = HOMEKIT_CHARACTERISTIC_(CURRENT_RELATIVE_HUMIDITY, 50.0);
+homekit_characteristic_t cha_motion_detected = HOMEKIT_CHARACTERISTIC_(MOTION_DETECTED, false);
+homekit_characteristic_t cha_light_level = HOMEKIT_CHARACTERISTIC_(CURRENT_AMBIENT_LIGHT_LEVEL, 10.0);
 
 homekit_accessory_t *accessories[] = {
     HOMEKIT_ACCESSORY(.id = 1, .category = homekit_accessory_category_switch,
@@ -28,6 +32,30 @@ homekit_accessory_t *accessories[] = {
                 .characteristics = (homekit_characteristic_t*[]) {
                     &cha_switch_on,
                     &cha_name,
+                    NULL
+                }),
+            HOMEKIT_SERVICE(TEMPERATURE_SENSOR,
+                .characteristics = (homekit_characteristic_t*[]) {
+                    HOMEKIT_CHARACTERISTIC(NAME, "Sicaklik"),
+                    &cha_temperature,
+                    NULL
+                }),
+            HOMEKIT_SERVICE(HUMIDITY_SENSOR,
+                .characteristics = (homekit_characteristic_t*[]) {
+                    HOMEKIT_CHARACTERISTIC(NAME, "Nem"),
+                    &cha_humidity,
+                    NULL
+                }),
+            HOMEKIT_SERVICE(MOTION_SENSOR,
+                .characteristics = (homekit_characteristic_t*[]) {
+                    HOMEKIT_CHARACTERISTIC(NAME, "Hareket"),
+                    &cha_motion_detected,
+                    NULL
+                }),
+            HOMEKIT_SERVICE(LIGHT_SENSOR,
+                .characteristics = (homekit_characteristic_t*[]) {
+                    HOMEKIT_CHARACTERISTIC(NAME, "Isik"),
+                    &cha_light_level,
                     NULL
                 }),
             NULL
