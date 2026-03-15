@@ -9,6 +9,10 @@
 #include <user_interface.h>
 #include "wifi_info.h"
 
+#ifndef APP_VERSION
+#define APP_VERSION "dev-local"
+#endif
+
 extern "C" {
 #include <homekit/homekit.h>
 extern homekit_server_config_t config;
@@ -88,13 +92,28 @@ static String jsonEscape(const String &value) {
 }
 
 static String extractJsonString(const String &json, const String &key) {
-  const String token = "\"" + key + "\":\"";
-  const int start = json.indexOf(token);
-  if (start < 0) {
+  const String token = "\"" + key + "\"";
+  int keyIndex = json.indexOf(token);
+  if (keyIndex < 0) {
     return "";
   }
 
-  const int valueStart = start + token.length();
+  keyIndex = json.indexOf(':', keyIndex + token.length());
+  if (keyIndex < 0) {
+    return "";
+  }
+
+  int valueStart = keyIndex + 1;
+  while (valueStart < static_cast<int>(json.length()) &&
+         (json[valueStart] == ' ' || json[valueStart] == '\n' || json[valueStart] == '\r' || json[valueStart] == '\t')) {
+    valueStart++;
+  }
+
+  if (valueStart >= static_cast<int>(json.length()) || json[valueStart] != '"') {
+    return "";
+  }
+
+  valueStart++;
   const int valueEnd = json.indexOf('"', valueStart);
   if (valueEnd < 0) {
     return "";
