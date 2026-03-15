@@ -23,6 +23,9 @@ static uint32_t next_status_log_ms = 0;
 static uint32_t wifi_disconnect_since_ms = 0;
 static uint32_t next_wifi_retry_ms = 0;
 static uint32_t wifi_recovered_at_ms = 0;
+static uint32_t wifi_disconnect_count = 0;
+static uint32_t wifi_reconnect_count = 0;
+static uint32_t wifi_retry_count = 0;
 static bool wifi_was_connected = false;
 static bool should_restart_after_reconnect = false;
 static ESP8266WebServer webServer(HTTP_PORT);
@@ -124,7 +127,13 @@ static void handleRoot() {
   body += "\"mac\":\"" + WiFi.macAddress() + "\",";
   body += "\"bssid\":\"" + WiFi.BSSIDstr() + "\",";
   body += "\"channel\":" + String(WiFi.channel()) + ",";
-  body += "\"rssi\":" + String(WiFi.RSSI());
+  body += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  body += "\"sleep_mode\":\"NONE\",";
+  body += "\"auto_reconnect\":true,";
+  body += "\"disconnect_count\":" + String(wifi_disconnect_count) + ",";
+  body += "\"reconnect_count\":" + String(wifi_reconnect_count) + ",";
+  body += "\"retry_count\":" + String(wifi_retry_count) + ",";
+  body += "\"disconnect_duration_ms\":" + String(wifi_disconnect_since_ms == 0 ? 0 : millis() - wifi_disconnect_since_ms);
   body += "},";
   body += "\"relay\":{";
   body += "\"on\":";
@@ -202,6 +211,7 @@ static void handleWifiReconnect() {
       wifi_was_connected = true;
       wifi_recovered_at_ms = now;
       should_restart_after_reconnect = true;
+      wifi_reconnect_count++;
     }
     wifi_disconnect_since_ms = 0;
     next_wifi_retry_ms = 0;
@@ -217,6 +227,7 @@ static void handleWifiReconnect() {
     logf("Wi-Fi baglantisi koptu. Yeniden baglaniliyor...");
     wifi_was_connected = false;
     wifi_disconnect_since_ms = now;
+    wifi_disconnect_count++;
   } else if (wifi_disconnect_since_ms == 0) {
     wifi_disconnect_since_ms = now;
   }
@@ -226,6 +237,7 @@ static void handleWifiReconnect() {
     delay(100);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     next_wifi_retry_ms = now + 10000;
+    wifi_retry_count++;
     logf("Wi-Fi yeniden baglanma denemesi baslatildi.");
   }
 
