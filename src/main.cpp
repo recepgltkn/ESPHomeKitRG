@@ -17,6 +17,10 @@ extern "C" {
 #include <homekit/homekit.h>
 extern homekit_server_config_t config;
 extern homekit_characteristic_t cha_switch_on;
+extern homekit_characteristic_t cha_name;
+extern homekit_characteristic_t cha_accessory_name;
+extern homekit_characteristic_t cha_serial_number;
+extern homekit_characteristic_t cha_firmware_revision;
 }
 
 #define SERIAL_BAUD 115200
@@ -55,6 +59,10 @@ static String lastRemoteCommit = "";
 static String lastRemoteNotes = "";
 static bool updateAvailable = false;
 static uint32_t lastSuccessfulUpdateCheckMs = 0;
+static char deviceName[32] = APP_NAME;
+static char otaHostname[32] = "wemos-role";
+static char serialNumber[32] = "WEMOS-D1-R2-RELAY";
+static char firmwareRevision[16] = APP_VERSION;
 static ESP8266WebServer webServer(HTTP_PORT);
 static WiFiServer telnetServer(TELNET_PORT);
 static WiFiClient telnetClient;
@@ -75,6 +83,23 @@ static void logf(const char *fmt, ...) {
 
 static void setRelay(bool on) {
   digitalWrite(RELAY_PIN, on ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+}
+
+static void prepareDeviceIdentity() {
+  const unsigned long chipId = ESP.getChipId();
+  snprintf(deviceName, sizeof(deviceName), "%s %06lX", APP_NAME, chipId);
+  snprintf(otaHostname, sizeof(otaHostname), "wemos-role-%06lx", chipId);
+  snprintf(serialNumber, sizeof(serialNumber), "WEMOS-%06lX", chipId);
+  snprintf(firmwareRevision, sizeof(firmwareRevision), "%s", APP_VERSION);
+
+  cha_name.value.format = homekit_format_string;
+  cha_name.value.string_value = deviceName;
+  cha_accessory_name.value.format = homekit_format_string;
+  cha_accessory_name.value.string_value = deviceName;
+  cha_serial_number.value.format = homekit_format_string;
+  cha_serial_number.value.string_value = serialNumber;
+  cha_firmware_revision.value.format = homekit_format_string;
+  cha_firmware_revision.value.string_value = firmwareRevision;
 }
 
 static String htmlEscape(const String &value) {
@@ -441,7 +466,7 @@ static String buildStatusJson() {
   body.reserve(3072);
   body += "{";
   body += "\"device\":{";
-  body += "\"name\":\"" APP_NAME "\",";
+  body += "\"name\":\"" + String(deviceName) + "\",";
   body += "\"model\":\"D1MiniRelay\",";
   body += "\"firmware\":\"" APP_VERSION "\",";
   body += "\"chip_id\":\"" + String(ESP.getChipId(), HEX) + "\",";
@@ -450,7 +475,7 @@ static String buildStatusJson() {
   body += "\"sdk\":\"" + String(ESP.getSdkVersion()) + "\"";
   body += "},";
   body += "\"network\":{";
-  body += "\"hostname\":\"wemos-role\",";
+  body += "\"hostname\":\"" + String(otaHostname) + "\",";
   body += "\"wifi_ssid\":\"" + jsonEscape(wifiSsid) + "\",";
   body += "\"status\":" + String(WiFi.status()) + ",";
   body += "\"connected\":";
@@ -523,7 +548,7 @@ static String buildStatusJson() {
   body += (WiFi.status() == WL_CONNECTED) ? "http://" + WiFi.localIP().toString() + "/setup" : "http://192.168.4.1/setup";
   body += "\",";
   body += "\"telnet\":\"telnet " + WiFi.localIP().toString() + " 23\",";
-  body += "\"ota_host\":\"wemos-role.local\"";
+  body += "\"ota_host\":\"" + String(otaHostname) + ".local\"";
   body += "}";
   body += "}";
   return body;
@@ -619,7 +644,7 @@ static bool connectWifi() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  WiFi.hostname("wemos-role");
+  WiFi.hostname(otaHostname);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
   startSetupAccessPoint();
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
@@ -748,7 +773,7 @@ static void handleStatusPage() {
   body += ".good{color:var(--accent)}.warn{color:var(--warn)} a{color:var(--accent);text-decoration:none}.row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line)}";
   body += ".row:first-child{border-top:none}.pill{display:inline-block;border-radius:999px;padding:6px 10px;background:#ece6d8;font-size:12px}.footer{margin-top:16px;color:var(--muted)}";
   body += "</style></head><body><div class='wrap'>";
-  body += "<div class='hero'><div><div class='sub'>Canli cihaz paneli</div><h1>" APP_NAME "</h1></div><div class='pill'>Otomatik yenileme: 3 sn</div></div>";
+  body += "<div class='hero'><div><div class='sub'>Canli cihaz paneli</div><h1>" + String(deviceName) + "</h1></div><div class='pill'>Otomatik yenileme: 3 sn</div></div>";
   body += "<div class='grid'>";
   body += "<div class='card'><div class='label'>Role</div><div id='relay' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>Wi-Fi</div><div id='wifi' class='value'>-</div></div>";
@@ -803,7 +828,7 @@ static void handleUpdatePage() {
   body += "button:disabled{opacity:.5;cursor:not-allowed}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line)}.row:first-child{border-top:none}";
   body += "pre{white-space:pre-wrap;background:#f6f0e4;border-radius:12px;padding:14px;border:1px solid var(--line)}a{color:var(--accent);text-decoration:none}";
   body += "</style></head><body><div class='wrap'>";
-  body += "<div class='hero'><div><div class='label'>Manuel Firmware Guncelleme</div><h1 style='margin:6px 0 0'>/update</h1></div><div class='mono'>Cihaz: " APP_VERSION "</div></div>";
+  body += "<div class='hero'><div><div class='label'>Manuel Firmware Guncelleme</div><h1 style='margin:6px 0 0'>/update</h1></div><div class='mono'>Cihaz: " + String(deviceName) + "</div></div>";
   body += "<div class='grid'>";
   body += "<div class='card'><div class='label'>Mevcut Surum</div><div class='value mono'>" APP_VERSION "</div></div>";
   body += "<div class='card'><div class='label'>Son Bulunan Surum</div><div class='value mono'>";
@@ -890,7 +915,7 @@ static void setupWebServer() {
 }
 
 static void setupOta() {
-  ArduinoOTA.setHostname("wemos-role");
+  ArduinoOTA.setHostname(otaHostname);
   ArduinoOTA.onStart([]() {
     logf("OTA basladi.");
   });
@@ -901,7 +926,7 @@ static void setupOta() {
     logf("OTA hata: %u", error);
   });
   ArduinoOTA.begin();
-  logf("OTA hazir: wemos-role.local");
+  logf("OTA hazir: %s.local", otaHostname);
 }
 
 static void handleTelnet() {
@@ -983,6 +1008,7 @@ void setup() {
   Serial.println();
   telnetServer.begin();
   telnetServer.setNoDelay(true);
+  prepareDeviceIdentity();
   logf("D1 Mini HomeKit role baslatiliyor...");
 
   pinMode(RELAY_PIN, OUTPUT);
