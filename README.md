@@ -86,6 +86,13 @@ Baglanti notlari:
 #define WIFI_PASSWORD "PASSWORD"
 ```
 
+Bu repodaki mevcut varsayilan STA bilgileri:
+
+```text
+SSID: GULTEKIN
+Sifre: admin10.
+```
+
 ## Derleme ve USB ile Yukleme
 
 ```bash
