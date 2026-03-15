@@ -1,12 +1,13 @@
 # ESPHomeKitRG
 
-Wemos D1 Mini R2 tabanli, Apple HomeKit uyumlu tek kanalli role projesi.
+Wemos D1 Mini R2 tabanli, Apple HomeKit uyumlu role, sensor ve PWM cikis projesi.
 
 Bu proje ile:
 
 - roleyi iPhone `Home` uygulamasina dogrudan ekleyebilirsiniz
 - roleyi HomeKit uzerinden acip kapatabilirsiniz
 - ayni cihazda sicaklik, nem, hareket ve isik sensorlerini HomeKit'e ekleyebilirsiniz
+- iki ayri PWM cikis ile MOSFET uzerinden serit LED surebilirsiniz
 - fiziksel buton ile roleyi acip kapatabilirsiniz
 - cihazi USB baglamadan OTA ile guncelleyebilirsiniz
 - cihaz durumunu HTTP uzerinden gorebilirsiniz
@@ -23,6 +24,7 @@ Bu proje ile:
 - dijital cikisli `PIR` hareket sensoru
 - `A0` ile kullanilan LDR bolucu devresi
 - `D2` uzerinden GND'ye baglanan anlik buton
+- `D7` ve `D8` uzerinden surulen iki MOSFET/PWM cikisi
 - 5V uygun besleme
 
 Varsayilan pin plani:
@@ -31,6 +33,8 @@ Varsayilan pin plani:
 - `D2 / GPIO4`: buton
 - `D5 / GPIO14`: PIR
 - `D6 / GPIO12`: DHT22
+- `D7 / GPIO13`: PWM1 / MOSFET gate
+- `D8 / GPIO15`: PWM2 / MOSFET gate
 - `A0`: LDR
 
 Kodda role aktif seviyesi:
@@ -47,11 +51,14 @@ Baglanti notlari:
 - DHT22 data `D6`, besleme ve GND ortak
 - LDR dogrudan baglanmaz; `A0` icin uygun gerilim bolucu ile kullanilmalidir
 - `A0` pinine `3.3V` ustu gerilim verilmemelidir
+- MOSFET gate hatlari icin `10k` pull-down tavsiye edilir
+- harici LED serit beslemesi kullaniliyorsa Wemos GND ile ortak GND yapilmalidir
+- `D8` boot pini oldugu icin bu hatta ters lojik veya agir yuk baglanmamali, sadece uygun gate surucu/pull-down ile kullanilmalidir
 
 ## Ozellikler
 
 - Native HomeKit accessory olarak calisir
-- Home app uzerinden tek cihaz altinda `Switch`, `Temperature`, `Humidity`, `Motion` ve `Light` servisleri gorunur
+- Home app uzerinden tek cihaz altinda `Lightbulb`, `Temperature`, `Humidity`, `Motion`, `Light Sensor`, `PWM1 Lightbulb` ve `PWM2 Lightbulb` servisleri gorunur
 - Wi-Fi koparsa yeniden baglanmayi dener
 - Wi-Fi geri geldiginde HomeKit tarafini temiz toparlamak icin kontrollu restart uygular
 - `ArduinoOTA` ile kablosuz firmware guncelleme destekler
@@ -65,8 +72,8 @@ Baglanti notlari:
 
 ## Proje Yapisi
 
-- `src/main.cpp`: ana firmware, Wi-Fi, HomeKit, OTA, HTTP, Telnet, sensorler, buton, config
-- `src/my_accessory.c`: HomeKit accessory ve sensor service tanimlari
+- `src/main.cpp`: ana firmware, Wi-Fi, HomeKit, OTA, HTTP, Telnet, sensorler, buton, PWM cikislari, config
+- `src/my_accessory.c`: HomeKit accessory, sensor ve PWM service tanimlari
 - `include/wifi_info.h`: Wi-Fi bilgileri
 - `platformio.ini`: PlatformIO ortami
 
@@ -100,7 +107,7 @@ Cihaz Home uygulamasina su kod ile eklenir:
 111-11-111
 ```
 
-Home uygulamasinda cihaz adi varsayilan olarak `Wemos Role` gorunur.
+Home uygulamasinda cihaz adi varsayilan olarak `Wemos Role <CHIPID>` gorunur.
 
 Eger cihaz daha once eslestirilmis ve kaldirilmis ise bazen flash temizligi gerekebilir.
 
@@ -153,7 +160,13 @@ Calisma mantigi:
 Kurulum access point adi:
 
 ```text
-Wemos-Setup
+Wemos-Setup-<CHIPID>
+```
+
+Kurulum access point sifresi:
+
+```text
+12345678
 ```
 
 Iki farkli kullanim vardir:
@@ -174,7 +187,7 @@ http://192.168.68.101/setup
 
 ### 2. Cihaz mevcut Wi-Fi'ye baglanamazsa
 
-Bu durumda `Wemos-Setup` acik kalir.
+Bu durumda `Wemos-Setup-<CHIPID>` acik kalir.
 
 Telefondan veya bilgisayardan bu aga baglanip su adrese gidersiniz:
 
@@ -210,6 +223,7 @@ JSON olarak su bilgileri doner:
 - Wi-Fi reconnect sayaçlari
 - setup endpoint bilgisi
 - role durumu
+- PWM cikis durumlari
 - sensor olcumleri
 - config degerleri
 - HomeKit istemci sayisi
@@ -264,7 +278,7 @@ http://192.168.68.101/status
 Bu sayfa:
 
 - 3 saniyede bir otomatik yenilenir
-- role, Wi-Fi, RSSI, heap, sicaklik, nem, PIR ve isik bilgisini gosterir
+- role, Wi-Fi, RSSI, heap, sicaklik, nem, PIR, isik, PWM1 ve PWM2 bilgisini gosterir
 - update durumunu ve bir sonraki kontrol zamanini gosterir
 - ag, sistem ve servis detaylarini canli olarak listeler
 
@@ -291,6 +305,10 @@ Bu sayfadan su ayarlar degistirilebilir:
 - `temperature offset`
 - `humidity offset`
 - `button debounce ms`
+- `PWM1 default brightness`
+- `PWM2 default brightness`
+- `PWM1 invert 0/1`
+- `PWM2 invert 0/1`
 
 Ayarlar `LittleFS` icinde saklanir ve yeniden baslatma sonrasi korunur.
 
@@ -298,13 +316,15 @@ Ayarlar `LittleFS` icinde saklanir ve yeniden baslatma sonrasi korunur.
 
 Bu firmware tek bir Wemos D1 Mini uzerinde ayni anda su HomeKit servislerini sunar:
 
-- `Switch`
+- `Lightbulb`
 - `Temperature Sensor`
 - `Humidity Sensor`
 - `Motion Sensor`
 - `Light Sensor`
+- `PWM1 Lightbulb`
+- `PWM2 Lightbulb`
 
-Yani ayni aksesuar altinda hem role hem de DHT/PIR/LDR verileri Home uygulamasinda kullanilabilir.
+Yani ayni aksesuar altinda hem ana isik/röle hem de DHT/PIR/LDR verileri ve iki ek PWM LED cikisi Home uygulamasinda kullanilabilir.
 
 ## Buton Davranisi
 
@@ -316,6 +336,24 @@ Butona basildiginda:
 - HomeKit switch durumu aninda guncellenir
 
 Buton debounce suresi `/config` altindan ayarlanabilir.
+
+## PWM / MOSFET Cikislari
+
+Iki ek cikis HomeKit'te ayri ayri dim edilebilir:
+
+- `PWM1`: `D7`
+- `PWM2`: `D8`
+
+Tipik MOSFET baglantisi:
+
+- `D7` veya `D8` -> MOSFET gate
+- gate ile `GND` arasina `10k` pull-down
+- MOSFET source -> `GND`
+- MOSFET drain -> LED serit eksi
+- LED serit arti -> harici besleme arti
+- Wemos `GND` ve harici besleme `GND` ortak
+
+Bu cikislar HomeKit'te `On/Off` ve `Brightness` ile kontrol edilir.
 
 ## Varsayilan Ag Servisleri
 
@@ -352,8 +390,7 @@ Bu proje test ve kisisel kullanim icin hazirlanmistir.
 
 ## Gelecekte Eklenebilecekler
 
-- fiziksel buton destegi
-- HTML dashboard
+- RGB/RGBW cikis destegi
 - MQTT veya syslog entegrasyonu
 - guc tuketimi olcumu icin `INA219` destegi
 - ESP32 tabanli daha kararlı HomeKit varyanti

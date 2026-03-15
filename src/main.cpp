@@ -18,6 +18,7 @@ extern "C" {
 #include <homekit/homekit.h>
 extern homekit_server_config_t config;
 extern homekit_characteristic_t cha_switch_on;
+extern homekit_characteristic_t cha_switch_brightness;
 extern homekit_characteristic_t cha_name;
 extern homekit_characteristic_t cha_accessory_name;
 extern homekit_characteristic_t cha_serial_number;
@@ -26,6 +27,10 @@ extern homekit_characteristic_t cha_temperature;
 extern homekit_characteristic_t cha_humidity;
 extern homekit_characteristic_t cha_motion_detected;
 extern homekit_characteristic_t cha_light_level;
+extern homekit_characteristic_t cha_aux1_on;
+extern homekit_characteristic_t cha_aux1_brightness;
+extern homekit_characteristic_t cha_aux2_on;
+extern homekit_characteristic_t cha_aux2_brightness;
 }
 
 #define SERIAL_BAUD 115200
@@ -35,6 +40,8 @@ extern homekit_characteristic_t cha_light_level;
 #define BUTTON_PIN D2
 #define PIR_PIN D5
 #define DHT_PIN D6
+#define AUX1_PWM_PIN D7
+#define AUX2_PWM_PIN D8
 #define LDR_PIN A0
 #define HTTP_PORT 80
 #define TELNET_PORT 23
@@ -60,6 +67,10 @@ struct SensorConfig {
   int8_t temperature_offset_tenths;
   int8_t humidity_offset_tenths;
   uint16_t button_debounce_ms;
+  bool aux1_inverted;
+  bool aux2_inverted;
+  uint8_t aux1_default_brightness;
+  uint8_t aux2_default_brightness;
 };
 
 static uint32_t next_status_log_ms = 0;
@@ -111,13 +122,19 @@ static SensorConfig sensorConfig = {
   2500,
   0,
   0,
-  250
+  250,
+  false,
+  false,
+  100,
+  100
 };
 static float lastTemperatureC = 20.0f;
 static float lastHumidityPct = 50.0f;
 static uint16_t lastLdrRaw = 0;
 static float lastLux = 10.0f;
 static void setSwitchState(bool on, bool notifyHomeKit);
+static void setMainBrightness(int value, bool notifyHomeKit);
+static void applyAuxOutput(uint8_t channel, bool on, int brightness, bool notifyHomeKit);
 
 static void logf(const char *fmt, ...) {
   char buffer[256];
@@ -135,6 +152,39 @@ static void logf(const char *fmt, ...) {
 
 static void setRelay(bool on) {
   digitalWrite(RELAY_PIN, on ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+}
+
+static int brightnessToPwm(const int brightness, const bool inverted) {
+  const int safeBrightness = brightness < 0 ? 0 : (brightness > 100 ? 100 : brightness);
+  int pwm = map(safeBrightness, 0, 100, 0, 1023);
+  if (inverted) {
+    pwm = 1023 - pwm;
+  }
+  return pwm;
+}
+
+static void applyAuxOutput(uint8_t channel, bool on, int brightness, bool notifyHomeKit) {
+  const int effectiveBrightness = on ? (brightness < 1 ? 1 : brightness) : 0;
+  const int pwmValue = brightnessToPwm(effectiveBrightness, channel == 1 ? sensorConfig.aux1_inverted : sensorConfig.aux2_inverted);
+
+  if (channel == 1) {
+    analogWrite(AUX1_PWM_PIN, pwmValue);
+    cha_aux1_on.value.bool_value = on;
+    cha_aux1_brightness.value.int_value = on ? effectiveBrightness : 0;
+    if (notifyHomeKit) {
+      homekit_characteristic_notify(&cha_aux1_on, cha_aux1_on.value);
+      homekit_characteristic_notify(&cha_aux1_brightness, cha_aux1_brightness.value);
+    }
+    return;
+  }
+
+  analogWrite(AUX2_PWM_PIN, pwmValue);
+  cha_aux2_on.value.bool_value = on;
+  cha_aux2_brightness.value.int_value = on ? effectiveBrightness : 0;
+  if (notifyHomeKit) {
+    homekit_characteristic_notify(&cha_aux2_on, cha_aux2_on.value);
+    homekit_characteristic_notify(&cha_aux2_brightness, cha_aux2_brightness.value);
+  }
 }
 
 static void prepareDeviceIdentity() {
@@ -254,6 +304,16 @@ static uint32_t clampU32(long value, uint32_t minValue, uint32_t maxValue) {
     return maxValue;
   }
   return static_cast<uint32_t>(value);
+}
+
+static uint8_t clampU8(long value, uint8_t minValue, uint8_t maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return static_cast<uint8_t>(value);
 }
 
 static int8_t clampI8(long value, int8_t minValue, int8_t maxValue) {
@@ -551,6 +611,10 @@ static void loadSensorConfig() {
   sensorConfig.temperature_offset_tenths = clampI8(readConfigLine(file).toInt(), -100, 100);
   sensorConfig.humidity_offset_tenths = clampI8(readConfigLine(file).toInt(), -100, 100);
   sensorConfig.button_debounce_ms = clampU16(readConfigLine(file).toInt(), 50, 2000);
+  sensorConfig.aux1_inverted = readConfigLine(file) == "1";
+  sensorConfig.aux2_inverted = readConfigLine(file) == "1";
+  sensorConfig.aux1_default_brightness = clampU8(readConfigLine(file).toInt(), 0, 100);
+  sensorConfig.aux2_default_brightness = clampU8(readConfigLine(file).toInt(), 0, 100);
   file.close();
 }
 
@@ -567,6 +631,10 @@ static bool saveSensorConfig() {
   file.println(sensorConfig.temperature_offset_tenths);
   file.println(sensorConfig.humidity_offset_tenths);
   file.println(sensorConfig.button_debounce_ms);
+  file.println(sensorConfig.aux1_inverted ? 1 : 0);
+  file.println(sensorConfig.aux2_inverted ? 1 : 0);
+  file.println(sensorConfig.aux1_default_brightness);
+  file.println(sensorConfig.aux2_default_brightness);
   file.close();
   return true;
 }
@@ -761,7 +829,19 @@ static String buildStatusJson() {
   body += "\"on\":";
   body += cha_switch_on.value.bool_value ? "true" : "false";
   body += ",";
-  body += "\"gpio\":" + String(RELAY_PIN);
+  body += "\"gpio\":" + String(RELAY_PIN) + ",";
+  body += "\"brightness\":" + String(cha_switch_brightness.value.int_value);
+  body += "},";
+  body += "\"outputs\":{";
+  body += "\"aux1\":{\"gpio\":\"D7\",\"on\":";
+  body += cha_aux1_on.value.bool_value ? "true" : "false";
+  body += ",\"brightness\":" + String(cha_aux1_brightness.value.int_value) + ",\"inverted\":";
+  body += sensorConfig.aux1_inverted ? "true" : "false";
+  body += "},";
+  body += "\"aux2\":{\"gpio\":\"D8\",\"on\":";
+  body += cha_aux2_on.value.bool_value ? "true" : "false";
+  body += ",\"brightness\":" + String(cha_aux2_brightness.value.int_value) + ",\"inverted\":";
+  body += sensorConfig.aux2_inverted ? "true" : "false";
   body += "},";
   body += "\"sensors\":{";
   body += "\"temperature_c\":" + String(lastTemperatureC, 1) + ",";
@@ -776,14 +856,22 @@ static String buildStatusJson() {
   body += "\"light_lux\":" + String(lastLux, 1);
   body += "},";
   body += "\"config\":{";
-  body += "\"pins\":{\"relay\":\"D1\",\"button\":\"D2\",\"pir\":\"D5\",\"dht\":\"D6\",\"ldr\":\"A0\"},";
+  body += "\"pins\":{\"relay\":\"D1\",\"button\":\"D2\",\"pir\":\"D5\",\"dht\":\"D6\",\"ldr\":\"A0\",\"aux1\":\"D7\",\"aux2\":\"D8\"},";
   body += "\"ldr_threshold\":" + String(sensorConfig.ldr_threshold) + ",";
   body += "\"ldr_hysteresis\":" + String(sensorConfig.ldr_hysteresis) + ",";
   body += "\"pir_hold_ms\":" + String(sensorConfig.pir_hold_ms) + ",";
   body += "\"pir_cooldown_ms\":" + String(sensorConfig.pir_cooldown_ms) + ",";
   body += "\"temperature_offset_c\":" + String(sensorConfig.temperature_offset_tenths / 10.0f, 1) + ",";
   body += "\"humidity_offset_pct\":" + String(sensorConfig.humidity_offset_tenths / 10.0f, 1) + ",";
-  body += "\"button_debounce_ms\":" + String(sensorConfig.button_debounce_ms);
+  body += "\"button_debounce_ms\":" + String(sensorConfig.button_debounce_ms) + ",";
+  body += "\"aux1_inverted\":";
+  body += sensorConfig.aux1_inverted ? "true" : "false";
+  body += ",";
+  body += "\"aux2_inverted\":";
+  body += sensorConfig.aux2_inverted ? "true" : "false";
+  body += ",";
+  body += "\"aux1_default_brightness\":" + String(sensorConfig.aux1_default_brightness) + ",";
+  body += "\"aux2_default_brightness\":" + String(sensorConfig.aux2_default_brightness);
   body += "},";
   body += "\"homekit\":{";
   body += "\"clients\":" + String(arduino_homekit_connected_clients_count()) + ",";
@@ -923,12 +1011,20 @@ static bool installPendingUpdate() {
 
 static void setSwitchState(bool on, bool notifyHomeKit) {
   cha_switch_on.value.bool_value = on;
+  cha_switch_brightness.value.int_value = on ? (cha_switch_brightness.value.int_value > 0 ? cha_switch_brightness.value.int_value : 100) : 0;
   setRelay(on);
   logf("Role durumu: %s", on ? "ACIK" : "KAPALI");
 
   if (notifyHomeKit) {
     homekit_characteristic_notify(&cha_switch_on, cha_switch_on.value);
+    homekit_characteristic_notify(&cha_switch_brightness, cha_switch_brightness.value);
   }
+}
+
+static void setMainBrightness(int value, bool notifyHomeKit) {
+  const int brightness = value < 0 ? 0 : (value > 100 ? 100 : value);
+  cha_switch_brightness.value.int_value = brightness;
+  setSwitchState(brightness > 0, notifyHomeKit);
 }
 
 static bool connectWifi() {
@@ -969,8 +1065,37 @@ void switchSetter(const homekit_value_t value) {
   setSwitchState(on, false);
 }
 
+void switchBrightnessSetter(const homekit_value_t value) {
+  setMainBrightness(value.int_value, false);
+}
+
+void aux1SwitchSetter(const homekit_value_t value) {
+  const int brightness = cha_aux1_brightness.value.int_value > 0 ? cha_aux1_brightness.value.int_value : sensorConfig.aux1_default_brightness;
+  applyAuxOutput(1, value.bool_value, brightness, false);
+}
+
+void aux1BrightnessSetter(const homekit_value_t value) {
+  const int brightness = value.int_value;
+  applyAuxOutput(1, brightness > 0, brightness, false);
+}
+
+void aux2SwitchSetter(const homekit_value_t value) {
+  const int brightness = cha_aux2_brightness.value.int_value > 0 ? cha_aux2_brightness.value.int_value : sensorConfig.aux2_default_brightness;
+  applyAuxOutput(2, value.bool_value, brightness, false);
+}
+
+void aux2BrightnessSetter(const homekit_value_t value) {
+  const int brightness = value.int_value;
+  applyAuxOutput(2, brightness > 0, brightness, false);
+}
+
 static void setupHomeKit() {
   cha_switch_on.setter = switchSetter;
+  cha_switch_brightness.setter = switchBrightnessSetter;
+  cha_aux1_on.setter = aux1SwitchSetter;
+  cha_aux1_brightness.setter = aux1BrightnessSetter;
+  cha_aux2_on.setter = aux2SwitchSetter;
+  cha_aux2_brightness.setter = aux2BrightnessSetter;
   arduino_homekit_setup(&config);
 }
 
@@ -1056,7 +1181,7 @@ static void handleConfigPage() {
   body += "small{color:#6a635a}";
   body += "</style></head><body>";
   body += "<h1>/config</h1>";
-  body += "<section><strong>Pinler</strong><br><small>Role=D1, Buton=D2, PIR=D5, DHT=D6, LDR=A0</small></section>";
+  body += "<section><strong>Pinler</strong><br><small>Role=D1, Buton=D2, PIR=D5, DHT=D6, LDR=A0, PWM1=D7, PWM2=D8</small></section>";
   body += "<form method='POST' action='/config'>";
   body += "<div class='grid'>";
   body += "<label>LDR esik (0-1023)<input name='ldr_threshold' type='number' min='0' max='1023' value='" + String(sensorConfig.ldr_threshold) + "'></label>";
@@ -1066,6 +1191,10 @@ static void handleConfigPage() {
   body += "<label>Sicaklik offset (0.1C)<input name='temperature_offset_tenths' type='number' min='-100' max='100' value='" + String(sensorConfig.temperature_offset_tenths) + "'></label>";
   body += "<label>Nem offset (0.1%)<input name='humidity_offset_tenths' type='number' min='-100' max='100' value='" + String(sensorConfig.humidity_offset_tenths) + "'></label>";
   body += "<label>Buton debounce ms<input name='button_debounce_ms' type='number' min='50' max='2000' value='" + String(sensorConfig.button_debounce_ms) + "'></label>";
+  body += "<label>PWM1 varsayilan parlaklik<input name='aux1_default_brightness' type='number' min='0' max='100' value='" + String(sensorConfig.aux1_default_brightness) + "'></label>";
+  body += "<label>PWM2 varsayilan parlaklik<input name='aux2_default_brightness' type='number' min='0' max='100' value='" + String(sensorConfig.aux2_default_brightness) + "'></label>";
+  body += "<label>PWM1 invert 0/1<input name='aux1_inverted' type='number' min='0' max='1' value='" + String(sensorConfig.aux1_inverted ? 1 : 0) + "'></label>";
+  body += "<label>PWM2 invert 0/1<input name='aux2_inverted' type='number' min='0' max='1' value='" + String(sensorConfig.aux2_inverted ? 1 : 0) + "'></label>";
   body += "</div><button type='submit'>Kaydet</button></form>";
   body += "</body></html>";
   webServer.send(200, "text/html; charset=utf-8", body);
@@ -1079,6 +1208,10 @@ static void handleConfigSave() {
   sensorConfig.temperature_offset_tenths = clampI8(webServer.arg("temperature_offset_tenths").toInt(), -100, 100);
   sensorConfig.humidity_offset_tenths = clampI8(webServer.arg("humidity_offset_tenths").toInt(), -100, 100);
   sensorConfig.button_debounce_ms = clampU16(webServer.arg("button_debounce_ms").toInt(), 50, 2000);
+  sensorConfig.aux1_default_brightness = clampU8(webServer.arg("aux1_default_brightness").toInt(), 0, 100);
+  sensorConfig.aux2_default_brightness = clampU8(webServer.arg("aux2_default_brightness").toInt(), 0, 100);
+  sensorConfig.aux1_inverted = webServer.arg("aux1_inverted").toInt() == 1;
+  sensorConfig.aux2_inverted = webServer.arg("aux2_inverted").toInt() == 1;
 
   if (!saveSensorConfig()) {
     webServer.send(500, "text/plain", "Config kaydedilemedi.");
@@ -1086,6 +1219,8 @@ static void handleConfigSave() {
   }
 
   updateLightState(analogRead(LDR_PIN), false);
+  applyAuxOutput(1, cha_aux1_on.value.bool_value, cha_aux1_brightness.value.int_value, false);
+  applyAuxOutput(2, cha_aux2_on.value.bool_value, cha_aux2_brightness.value.int_value, false);
   webServer.send(200, "text/html; charset=utf-8",
                  "<html><body><h1>Kaydedildi</h1><p>Ayarlar uygulandi.</p><p><a href='/config'>Geri don</a></p></body></html>");
 }
@@ -1122,6 +1257,8 @@ static void handleStatusPage() {
   body += "<div class='card'><div class='label'>Nem</div><div id='hum' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>PIR</div><div id='pir' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>Isik</div><div id='ldr' class='value'>-</div></div>";
+  body += "<div class='card'><div class='label'>PWM1</div><div id='aux1' class='value'>-</div></div>";
+  body += "<div class='card'><div class='label'>PWM2</div><div id='aux2' class='value'>-</div></div>";
   body += "<div class='card'><div class='label'>Version</div><div id='version' class='value mono'>-</div></div>";
   body += "<div class='card'><div class='label'>Update</div><div id='update' class='value mono'>-</div></div>";
   body += "<div class='card'><div class='label'>Sonraki Kontrol</div><div id='nextCheck' class='value mono'>-</div></div>";
@@ -1144,12 +1281,14 @@ static void handleStatusPage() {
   body += "set('hum',`${d.sensors.humidity_pct} %`,d.sensors.humidity_pct<75?'good':'warn');";
   body += "set('pir',d.sensors.motion?'HAREKET':'BOS',d.sensors.motion?'warn':'good');";
   body += "set('ldr',`${d.sensors.light_lux} lux`,d.sensors.ldr_dark?'warn':'good');";
+  body += "set('aux1',`${d.outputs.aux1.brightness}%`,d.outputs.aux1.on?'good':'warn');";
+  body += "set('aux2',`${d.outputs.aux2.brightness}%`,d.outputs.aux2.on?'good':'warn');";
   body += "set('version',d.update.current_version,'mono');";
   body += "set('update',d.update.in_progress?'YUKLENIYOR':d.update.last_result,'mono');";
   body += "set('nextCheck',`${Math.ceil(d.update.next_check_in_ms/1000)} sn`,'mono');";
   body += "rows('networkRows',[['SSID',d.network.wifi_ssid],['IP',d.network.ip],['BSSID',d.network.bssid],['Kanal',d.network.channel],['RSSI',`${d.network.rssi} dBm`],['Reconnect',d.network.reconnect_count],['Retry',d.network.retry_count],['Setup AP',d.network.setup_ap_active?'ACIK':'KAPALI']]);";
   body += "rows('systemRows',[['Uptime(ms)',d.system.uptime_ms],['Reset',d.system.reset_reason],['Fragmentation',d.system.heap_fragmentation],['Max block',d.system.max_free_block],['Sketch',d.system.sketch_size],['Clients',d.homekit.clients],['Son istemci',`${Math.floor(d.homekit.last_client_seen_ms_ago/1000)} sn once`],['Recovery',d.homekit.recovery_pending?'BEKLIYOR':'NORMAL'],['LDR raw',d.sensors.ldr_raw],['Karanlik',d.sensors.ldr_dark?'EVET':'HAYIR']]);";
-  body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Config',d.services.config],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Manifest',d.update.manifest_url],['Yeni surum',d.update.last_remote_version||'-']]);";
+  body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Config',d.services.config],['PWM1',`${d.outputs.aux1.gpio} / ${d.outputs.aux1.inverted?'INV':'NOR'}`],['PWM2',`${d.outputs.aux2.gpio} / ${d.outputs.aux2.inverted?'INV':'NOR'}`],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Manifest',d.update.manifest_url],['Yeni surum',d.update.last_remote_version||'-']]);";
   body += "}catch(e){set('update','baglanti hatasi','warn');}} load(); setInterval(load," + String(STATUS_REFRESH_MS) + ");";
   body += "</script></body></html>";
   webServer.send(200, "text/html; charset=utf-8", body);
@@ -1412,6 +1551,9 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(PIR_PIN, INPUT);
+  pinMode(AUX1_PWM_PIN, OUTPUT);
+  pinMode(AUX2_PWM_PIN, OUTPUT);
+  analogWriteRange(1023);
   setRelay(false);
   dht.setup(DHT_PIN, DHTesp::DHT22);
 
@@ -1420,6 +1562,9 @@ void setup() {
   updateClimateState(lastTemperatureC, lastHumidityPct, false);
   updateLightState(analogRead(LDR_PIN), false);
   updateMotionState(false, false);
+  cha_switch_brightness.value.int_value = 100;
+  applyAuxOutput(1, false, sensorConfig.aux1_default_brightness, false);
+  applyAuxOutput(2, false, sensorConfig.aux2_default_brightness, false);
   const bool wifiConnected = connectWifi();
 
   setupWebServer();
