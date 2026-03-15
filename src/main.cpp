@@ -21,8 +21,8 @@ extern homekit_characteristic_t cha_switch_on;
 
 #define SERIAL_BAUD 115200
 #define RELAY_PIN D1
-#define RELAY_ACTIVE_LEVEL LOW
-#define RELAY_INACTIVE_LEVEL HIGH
+#define RELAY_ACTIVE_LEVEL HIGH
+#define RELAY_INACTIVE_LEVEL LOW
 #define HTTP_PORT 80
 #define TELNET_PORT 23
 #define WIFI_CONFIG_FILE "/wifi.txt"
