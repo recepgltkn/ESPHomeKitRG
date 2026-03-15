@@ -36,6 +36,9 @@ extern homekit_characteristic_t cha_firmware_revision;
 #define UPDATE_CHECK_INTERVAL_MS 60000UL
 #define AUTO_UPDATE_ENABLED false
 #define UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/version.json"
+#define HOMEKIT_RECOVERY_IDLE_MS 180000UL
+#define HOMEKIT_RECOVERY_GRACE_MS 120000UL
+#define HOMEKIT_RECOVERY_COOLDOWN_MS 600000UL
 
 static uint32_t next_status_log_ms = 0;
 static uint32_t wifi_disconnect_since_ms = 0;
@@ -59,6 +62,10 @@ static String lastRemoteCommit = "";
 static String lastRemoteNotes = "";
 static bool updateAvailable = false;
 static uint32_t lastSuccessfulUpdateCheckMs = 0;
+static uint32_t homekitLastClientSeenMs = 0;
+static uint32_t homekitLastRecoveryRestartMs = 0;
+static bool homekitEverHadClient = false;
+static bool homekitRecoveryPending = false;
 static char deviceName[32] = APP_NAME;
 static char otaHostname[32] = "wemos-role";
 static char serialNumber[32] = "WEMOS-D1-R2-RELAY";
@@ -506,7 +513,16 @@ static String buildStatusJson() {
   body += "},";
   body += "\"homekit\":{";
   body += "\"clients\":" + String(arduino_homekit_connected_clients_count()) + ",";
-  body += "\"pairing_code\":\"111-11-111\"";
+  body += "\"pairing_code\":\"111-11-111\",";
+  body += "\"ever_had_client\":";
+  body += homekitEverHadClient ? "true" : "false";
+  body += ",";
+  body += "\"last_client_seen_ms_ago\":" + String(homekitLastClientSeenMs == 0 ? 0 : millis() - homekitLastClientSeenMs) + ",";
+  body += "\"recovery_idle_ms\":" + String(HOMEKIT_RECOVERY_IDLE_MS) + ",";
+  body += "\"recovery_grace_ms\":" + String(HOMEKIT_RECOVERY_GRACE_MS) + ",";
+  body += "\"recovery_cooldown_ms\":" + String(HOMEKIT_RECOVERY_COOLDOWN_MS) + ",";
+  body += "\"recovery_pending\":";
+  body += homekitRecoveryPending ? "true" : "false";
   body += "},";
   body += "\"update\":{";
   body += "\"auto_update_enabled\":";
@@ -801,7 +817,7 @@ static void handleStatusPage() {
   body += "set('update',d.update.in_progress?'YUKLENIYOR':d.update.last_result,'mono');";
   body += "set('nextCheck',`${Math.ceil(d.update.next_check_in_ms/1000)} sn`,'mono');";
   body += "rows('networkRows',[['SSID',d.network.wifi_ssid],['IP',d.network.ip],['BSSID',d.network.bssid],['Kanal',d.network.channel],['RSSI',`${d.network.rssi} dBm`],['Reconnect',d.network.reconnect_count],['Retry',d.network.retry_count],['Setup AP',d.network.setup_ap_active?'ACIK':'KAPALI']]);";
-  body += "rows('systemRows',[['Uptime(ms)',d.system.uptime_ms],['Reset',d.system.reset_reason],['Fragmentation',d.system.heap_fragmentation],['Max block',d.system.max_free_block],['Sketch',d.system.sketch_size],['Clients',d.homekit.clients],['Son kontrol',`${Math.floor(d.update.last_check_ms_ago/1000)} sn once`],['Basarili kontrol',`${Math.floor(d.update.last_successful_check_ms_ago/1000)} sn once`]]);";
+  body += "rows('systemRows',[['Uptime(ms)',d.system.uptime_ms],['Reset',d.system.reset_reason],['Fragmentation',d.system.heap_fragmentation],['Max block',d.system.max_free_block],['Sketch',d.system.sketch_size],['Clients',d.homekit.clients],['Son istemci',`${Math.floor(d.homekit.last_client_seen_ms_ago/1000)} sn once`],['Recovery',d.homekit.recovery_pending?'BEKLIYOR':'NORMAL'],['Son kontrol',`${Math.floor(d.update.last_check_ms_ago/1000)} sn once`],['Basarili kontrol',`${Math.floor(d.update.last_successful_check_ms_ago/1000)} sn once`]]);";
   body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Manifest',d.update.manifest_url],['Yeni surum',d.update.last_remote_version||'-']]);";
   body += "}catch(e){set('update','baglanti hatasi','warn');}} load(); setInterval(load," + String(STATUS_REFRESH_MS) + ");";
   body += "</script></body></html>";
@@ -957,6 +973,52 @@ static void checkForUpdates() {
   refreshUpdateMetadata(false);
 }
 
+static void handleHomeKitHealth() {
+  if (WiFi.status() != WL_CONNECTED || updateInProgress) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const int clientCount = arduino_homekit_connected_clients_count();
+
+  if (clientCount > 0) {
+    homekitEverHadClient = true;
+    homekitLastClientSeenMs = now;
+    homekitRecoveryPending = false;
+    return;
+  }
+
+  if (!homekitEverHadClient) {
+    return;
+  }
+
+  if (now < HOMEKIT_RECOVERY_GRACE_MS) {
+    return;
+  }
+
+  if (homekitLastClientSeenMs == 0) {
+    homekitLastClientSeenMs = now;
+    return;
+  }
+
+  if (now - homekitLastClientSeenMs < HOMEKIT_RECOVERY_IDLE_MS) {
+    return;
+  }
+
+  if (homekitLastRecoveryRestartMs != 0 && now - homekitLastRecoveryRestartMs < HOMEKIT_RECOVERY_COOLDOWN_MS) {
+    return;
+  }
+
+  if (!homekitRecoveryPending) {
+    homekitRecoveryPending = true;
+    logf("HomeKit istemcisi %lu ms yok. Servis toparlama icin yeniden baslatiliyor.", now - homekitLastClientSeenMs);
+  }
+
+  homekitLastRecoveryRestartMs = now;
+  delay(200);
+  ESP.restart();
+}
+
 static void handleWifiReconnect() {
   const wl_status_t status = WiFi.status();
   const uint32_t now = millis();
@@ -968,6 +1030,8 @@ static void handleWifiReconnect() {
       wifi_recovered_at_ms = now;
       should_restart_after_reconnect = true;
       wifi_reconnect_count++;
+      homekitLastClientSeenMs = now;
+      homekitRecoveryPending = false;
     }
     wifi_disconnect_since_ms = 0;
     next_wifi_retry_ms = 0;
@@ -984,6 +1048,7 @@ static void handleWifiReconnect() {
     wifi_was_connected = false;
     wifi_disconnect_since_ms = now;
     wifi_disconnect_count++;
+    homekitRecoveryPending = false;
   } else if (wifi_disconnect_since_ms == 0) {
     wifi_disconnect_since_ms = now;
   }
@@ -1036,6 +1101,7 @@ void loop() {
     checkForUpdates();
     ArduinoOTA.handle();
     arduino_homekit_loop();
+    handleHomeKitHealth();
   }
   delay(10);
 
