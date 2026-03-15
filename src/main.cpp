@@ -30,7 +30,8 @@ extern homekit_characteristic_t cha_switch_on;
 #define APP_NAME "Wemos Role"
 #define STATUS_REFRESH_MS 3000UL
 #define UPDATE_CHECK_INTERVAL_MS 60000UL
-#define UPDATE_MANIFEST_URL "https://recepgltkn.github.io/ESPHomeKitRG/latest/version.json"
+#define AUTO_UPDATE_ENABLED false
+#define UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/version.json"
 
 static uint32_t next_status_log_ms = 0;
 static uint32_t wifi_disconnect_since_ms = 0;
@@ -49,6 +50,9 @@ static bool updateInProgress = false;
 static String lastUpdateResult = "never_checked";
 static String lastRemoteVersion = "";
 static String lastRemoteBinUrl = "";
+static String lastRemoteBuildTime = "";
+static String lastRemoteCommit = "";
+static String lastRemoteNotes = "";
 static bool updateAvailable = false;
 static uint32_t lastSuccessfulUpdateCheckMs = 0;
 static ESP8266WebServer webServer(HTTP_PORT);
@@ -117,6 +121,38 @@ static String extractJsonString(const String &json, const String &key) {
   const int valueEnd = json.indexOf('"', valueStart);
   if (valueEnd < 0) {
     return "";
+  }
+
+  return json.substring(valueStart, valueEnd);
+}
+
+static String extractJsonValue(const String &json, const String &key) {
+  String value = extractJsonString(json, key);
+  if (value.length() > 0) {
+    return value;
+  }
+
+  const String token = "\"" + key + "\"";
+  int keyIndex = json.indexOf(token);
+  if (keyIndex < 0) {
+    return "";
+  }
+
+  keyIndex = json.indexOf(':', keyIndex + token.length());
+  if (keyIndex < 0) {
+    return "";
+  }
+
+  int valueStart = keyIndex + 1;
+  while (valueStart < static_cast<int>(json.length()) &&
+         (json[valueStart] == ' ' || json[valueStart] == '\n' || json[valueStart] == '\r' || json[valueStart] == '\t')) {
+    valueStart++;
+  }
+
+  int valueEnd = valueStart;
+  while (valueEnd < static_cast<int>(json.length()) &&
+         json[valueEnd] != ',' && json[valueEnd] != '\n' && json[valueEnd] != '\r' && json[valueEnd] != '}') {
+    valueEnd++;
   }
 
   return json.substring(valueStart, valueEnd);
@@ -448,10 +484,15 @@ static String buildStatusJson() {
   body += "\"pairing_code\":\"111-11-111\"";
   body += "},";
   body += "\"update\":{";
-  body += "\"auto_update_enabled\":true,";
+  body += "\"auto_update_enabled\":";
+  body += AUTO_UPDATE_ENABLED ? "true" : "false";
+  body += ",";
   body += "\"current_version\":\"" APP_VERSION "\",";
   body += "\"last_remote_version\":\"" + jsonEscape(lastRemoteVersion) + "\",";
   body += "\"last_remote_bin_url\":\"" + jsonEscape(lastRemoteBinUrl) + "\",";
+  body += "\"last_remote_build_time\":\"" + jsonEscape(lastRemoteBuildTime) + "\",";
+  body += "\"last_remote_commit\":\"" + jsonEscape(lastRemoteCommit) + "\",";
+  body += "\"last_remote_notes\":\"" + jsonEscape(lastRemoteNotes) + "\",";
   body += "\"manifest_url\":\"" UPDATE_MANIFEST_URL "\",";
   body += "\"check_interval_ms\":" + String(UPDATE_CHECK_INTERVAL_MS) + ",";
   body += "\"last_check_ms_ago\":" + String(lastUpdateCheckMs == 0 ? 0 : millis() - lastUpdateCheckMs) + ",";
@@ -486,6 +527,82 @@ static String buildStatusJson() {
   body += "}";
   body += "}";
   return body;
+}
+
+static bool refreshUpdateMetadata(bool forceCheck) {
+  if (WiFi.status() != WL_CONNECTED || updateInProgress) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  if (!forceCheck && lastUpdateCheckMs != 0 && now - lastUpdateCheckMs < UPDATE_CHECK_INTERVAL_MS) {
+    return true;
+  }
+  lastUpdateCheckMs = now;
+
+  String payload;
+  String requestError;
+  if (!httpsGetString(UPDATE_MANIFEST_URL, payload, requestError)) {
+    lastUpdateResult = "manifest_" + requestError;
+    return false;
+  }
+  lastSuccessfulUpdateCheckMs = now;
+
+  lastRemoteVersion = extractJsonString(payload, "version");
+  lastRemoteBinUrl = extractJsonString(payload, "bin_url");
+  lastRemoteBuildTime = extractJsonString(payload, "built_at");
+  lastRemoteCommit = extractJsonString(payload, "commit");
+  lastRemoteNotes = extractJsonString(payload, "notes");
+  if (lastRemoteNotes.length() == 0) {
+    lastRemoteNotes = extractJsonValue(payload, "notes");
+  }
+
+  if (lastRemoteVersion.length() == 0 || lastRemoteBinUrl.length() == 0) {
+    lastUpdateResult = "manifest_parse_failed";
+    return false;
+  }
+
+  if (lastRemoteVersion == APP_VERSION) {
+    updateAvailable = false;
+    lastUpdateResult = "up_to_date";
+    return true;
+  }
+
+  updateAvailable = true;
+  lastUpdateResult = "update_available";
+  return true;
+}
+
+static bool installPendingUpdate() {
+  if (WiFi.status() != WL_CONNECTED || updateInProgress) {
+    return false;
+  }
+
+  if (!refreshUpdateMetadata(true)) {
+    return false;
+  }
+
+  if (!updateAvailable || lastRemoteBinUrl.length() == 0) {
+    return false;
+  }
+
+  updateInProgress = true;
+  lastUpdateResult = "updating";
+  logf("Manuel update baslatildi. Hedef surum: %s", lastRemoteVersion.c_str());
+
+  String updateError;
+  if (httpsUpdateFromUrl(lastRemoteBinUrl, updateError)) {
+    lastUpdateResult = "update_ok";
+    logf("Manuel update tamamlandi. Yeniden baslatiliyor.");
+    delay(500);
+    ESP.restart();
+    return true;
+  }
+
+  updateInProgress = false;
+  lastUpdateResult = "update_" + updateError;
+  logf("Manuel update hatasi: %s", updateError.c_str());
+  return false;
 }
 
 static void setSwitchState(bool on, bool notifyHomeKit) {
@@ -666,10 +783,106 @@ static void handleStatusPage() {
   webServer.send(200, "text/html; charset=utf-8", body);
 }
 
+static void handleUpdatePage() {
+  refreshUpdateMetadata(true);
+
+  String notes = lastRemoteNotes;
+  notes.replace("\\n", "\n");
+
+  String body;
+  body.reserve(6000);
+  body += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  body += "<title>Wemos Update</title><style>";
+  body += ":root{--bg:#f2efe8;--card:#fffdf8;--ink:#171512;--muted:#6a635a;--line:#ddd5c7;--accent:#0d6b5f;--warn:#9a3412}";
+  body += "body{margin:0;background:linear-gradient(180deg,#f9f5ec 0,#efe9dd 100%);color:var(--ink);font-family:Georgia,serif}";
+  body += ".wrap{max-width:920px;margin:0 auto;padding:24px}.hero{display:flex;justify-content:space-between;gap:16px;align-items:end}";
+  body += ".card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 10px 28px rgba(0,0,0,.06);margin-top:16px}";
+  body += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.label{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}";
+  body += ".value{font-size:26px;margin-top:6px}.mono{font-family:ui-monospace,monospace;font-size:14px}.ok{color:var(--accent)}.warn{color:var(--warn)}";
+  body += "button{border:none;border-radius:999px;padding:12px 18px;font-size:15px;background:var(--ink);color:#fff;cursor:pointer}button.alt{background:#e8e0d0;color:var(--ink)}";
+  body += "button:disabled{opacity:.5;cursor:not-allowed}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line)}.row:first-child{border-top:none}";
+  body += "pre{white-space:pre-wrap;background:#f6f0e4;border-radius:12px;padding:14px;border:1px solid var(--line)}a{color:var(--accent);text-decoration:none}";
+  body += "</style></head><body><div class='wrap'>";
+  body += "<div class='hero'><div><div class='label'>Manuel Firmware Guncelleme</div><h1 style='margin:6px 0 0'>/update</h1></div><div class='mono'>Cihaz: " APP_VERSION "</div></div>";
+  body += "<div class='grid'>";
+  body += "<div class='card'><div class='label'>Mevcut Surum</div><div class='value mono'>" APP_VERSION "</div></div>";
+  body += "<div class='card'><div class='label'>Son Bulunan Surum</div><div class='value mono'>";
+  body += lastRemoteVersion.length() > 0 ? htmlEscape(lastRemoteVersion) : "-";
+  body += "</div></div>";
+  body += "<div class='card'><div class='label'>Durum</div><div id='updateState' class='value mono ";
+  body += updateAvailable ? "ok" : "warn";
+  body += "'>";
+  body += htmlEscape(lastUpdateResult);
+  body += "</div></div>";
+  body += "</div>";
+  body += "<div class='card'><div style='display:flex;gap:12px;flex-wrap:wrap'>";
+  body += "<button id='checkBtn' class='alt' onclick='runAction(\"check\")'>Yenilikleri Kontrol Et</button>";
+  body += "<button id='installBtn' onclick='runAction(\"install\")'";
+  if (!updateAvailable || updateInProgress) {
+    body += " disabled";
+  }
+  body += ">Surumu Yukle</button></div>";
+  body += "<div id='flashMsg' class='mono' style='margin-top:12px;color:var(--muted)'>Yukleme sirasinda cihaz yeniden baslayabilir.</div></div>";
+  body += "<div class='card'><div class='label'>Yenilikler</div><pre id='notes'>";
+  if (notes.length() > 0) {
+    body += htmlEscape(notes);
+  } else {
+    body += "Manifest notu yok. Commit: " + htmlEscape(lastRemoteCommit) + "\nBuild: " + htmlEscape(lastRemoteBuildTime);
+  }
+  body += "</pre></div>";
+  body += "<div class='card'><div class='label'>Detay</div>";
+  body += "<div class='row'><span>Commit</span><span class='mono' id='commit'>" + htmlEscape(lastRemoteCommit) + "</span></div>";
+  body += "<div class='row'><span>Build Time</span><span class='mono' id='builtAt'>" + htmlEscape(lastRemoteBuildTime) + "</span></div>";
+  body += "<div class='row'><span>Manifest</span><span class='mono'><a href='" UPDATE_MANIFEST_URL "'>" UPDATE_MANIFEST_URL "</a></span></div>";
+  body += "<div class='row'><span>Firmware</span><span class='mono' id='binUrl'>" + htmlEscape(lastRemoteBinUrl) + "</span></div>";
+  body += "</div>";
+  body += "</div><script>";
+  body += "async function load(){const r=await fetch('/api/status',{cache:'no-store'});return r.json();}";
+  body += "function sync(d){document.getElementById('updateState').textContent=d.update.last_result;";
+  body += "document.getElementById('notes').textContent=d.update.last_remote_notes||(`Manifest notu yok. Commit: ${d.update.last_remote_commit}\\nBuild: ${d.update.last_remote_build_time}`);";
+  body += "document.getElementById('commit').textContent=d.update.last_remote_commit||'-';";
+  body += "document.getElementById('builtAt').textContent=d.update.last_remote_build_time||'-';";
+  body += "document.getElementById('binUrl').textContent=d.update.last_remote_bin_url||'-';";
+  body += "document.getElementById('installBtn').disabled=!d.update.available||d.update.in_progress;}";
+  body += "async function runAction(kind){const msg=document.getElementById('flashMsg');msg.textContent='Islem baslatiliyor...';";
+  body += "const res=await fetch(kind==='check'?'/api/update/check':'/api/update/install',{method:'POST'});const data=await res.json();";
+  body += "msg.textContent=data.message||data.result||'Tamam';const state=await load();sync(state);} load().then(sync); setInterval(()=>load().then(sync).catch(()=>{}),5000);";
+  body += "</script></body></html>";
+  webServer.send(200, "text/html; charset=utf-8", body);
+}
+
+static void handleUpdateCheck() {
+  const bool ok = refreshUpdateMetadata(true);
+  String body = "{\"ok\":";
+  body += ok ? "true" : "false";
+  body += ",\"result\":\"" + jsonEscape(lastUpdateResult) + "\",\"message\":\"";
+  body += ok ? "Guncelleme bilgisi yenilendi." : "Manifest okunamadi.";
+  body += "\"}";
+  webServer.send(ok ? 200 : 500, "application/json", body);
+}
+
+static void handleUpdateInstall() {
+  if (updateInProgress) {
+    webServer.send(409, "application/json", "{\"ok\":false,\"result\":\"busy\",\"message\":\"Guncelleme zaten suruyor.\"}");
+    return;
+  }
+
+  const bool started = installPendingUpdate();
+  String body = "{\"ok\":";
+  body += started ? "true" : "false";
+  body += ",\"result\":\"" + jsonEscape(lastUpdateResult) + "\",\"message\":\"";
+  body += started ? "Yukleme baslatildi. Cihaz yeniden baslayabilir." : "Yukleme baslatilamadi.";
+  body += "\"}";
+  webServer.send(started ? 200 : 500, "application/json", body);
+}
+
 static void setupWebServer() {
   webServer.on("/", handleRoot);
   webServer.on("/api/status", handleApiStatus);
+  webServer.on("/api/update/check", HTTP_POST, handleUpdateCheck);
+  webServer.on("/api/update/install", HTTP_POST, handleUpdateInstall);
   webServer.on("/status", handleStatusPage);
+  webServer.on("/update", HTTP_GET, handleUpdatePage);
   webServer.on("/setup", HTTP_GET, handleSetupPage);
   webServer.on("/setup", HTTP_POST, handleSetupSave);
   webServer.begin();
@@ -709,56 +922,14 @@ static void handleTelnet() {
 }
 
 static void checkForUpdates() {
-  if (WiFi.status() != WL_CONNECTED || updateInProgress) {
+  if (!AUTO_UPDATE_ENABLED) {
+    if (lastUpdateResult == "never_checked") {
+      lastUpdateResult = "disabled";
+    }
     return;
   }
 
-  const uint32_t now = millis();
-  if (lastUpdateCheckMs != 0 && now - lastUpdateCheckMs < UPDATE_CHECK_INTERVAL_MS) {
-    return;
-  }
-  lastUpdateCheckMs = now;
-
-  String payload;
-  String requestError;
-  if (!httpsGetString(UPDATE_MANIFEST_URL, payload, requestError)) {
-    lastUpdateResult = "manifest_" + requestError;
-    return;
-  }
-  lastSuccessfulUpdateCheckMs = now;
-
-  const String remoteVersion = extractJsonString(payload, "version");
-  const String remoteBinUrl = extractJsonString(payload, "bin_url");
-  lastRemoteVersion = remoteVersion;
-  lastRemoteBinUrl = remoteBinUrl;
-
-  if (remoteVersion.length() == 0 || remoteBinUrl.length() == 0) {
-    lastUpdateResult = "manifest_parse_failed";
-    return;
-  }
-
-  if (remoteVersion == APP_VERSION) {
-    updateAvailable = false;
-    lastUpdateResult = "up_to_date";
-    return;
-  }
-
-  updateAvailable = true;
-  updateInProgress = true;
-  lastUpdateResult = "updating";
-  logf("Yeni surum bulundu: %s", remoteVersion.c_str());
-  String updateError;
-  if (httpsUpdateFromUrl(remoteBinUrl, updateError)) {
-    lastUpdateResult = "update_ok";
-    logf("Otomatik update tamamlandi. Yeniden baslatiliyor.");
-    delay(500);
-    ESP.restart();
-    return;
-  }
-
-  updateInProgress = false;
-  lastUpdateResult = "update_" + updateError;
-  logf("Otomatik update hatasi: %s", updateError.c_str());
+  refreshUpdateMetadata(false);
 }
 
 static void handleWifiReconnect() {
