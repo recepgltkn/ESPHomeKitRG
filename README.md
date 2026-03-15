@@ -119,7 +119,7 @@ Akis:
 Manifest adresi:
 
 ```text
-https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/version.json
+https://recepgltkn.github.io/ESPHomeKitRG/latest/version.json
 ```
 
 Not:

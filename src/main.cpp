@@ -30,7 +30,7 @@ extern homekit_characteristic_t cha_switch_on;
 #define APP_NAME "Wemos Role"
 #define STATUS_REFRESH_MS 3000UL
 #define UPDATE_CHECK_INTERVAL_MS 60000UL
-#define UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/version.json"
+#define UPDATE_MANIFEST_URL "https://recepgltkn.github.io/ESPHomeKitRG/latest/version.json"
 
 static uint32_t next_status_log_ms = 0;
 static uint32_t wifi_disconnect_since_ms = 0;
