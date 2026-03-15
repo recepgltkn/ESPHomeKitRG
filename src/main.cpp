@@ -278,16 +278,53 @@ static bool httpsUpdateFromUrl(const String &url, String &error) {
   }
 
   logf("Otomatik update basladi. Boyut: %d", contentLength);
-  const size_t written = Update.writeStream(client);
-  if (written != static_cast<size_t>(contentLength)) {
-    error = "write_mismatch_" + String(written) + "_" + String(contentLength);
-    Update.end();
-    client.stop();
-    return false;
+  uint8_t buffer[1024];
+  size_t totalWritten = 0;
+  uint32_t lastDataMs = millis();
+
+  while (totalWritten < static_cast<size_t>(contentLength)) {
+    const size_t availableBytes = client.available();
+    if (availableBytes == 0) {
+      if (!client.connected() && !client.available()) {
+        break;
+      }
+
+      if (millis() - lastDataMs > 15000) {
+        error = "update_read_timeout";
+        Update.end();
+        client.stop();
+        return false;
+      }
+
+      delay(1);
+      continue;
+    }
+
+    const size_t chunkSize = availableBytes > sizeof(buffer) ? sizeof(buffer) : availableBytes;
+    const int bytesRead = client.read(buffer, chunkSize);
+    if (bytesRead <= 0) {
+      continue;
+    }
+
+    lastDataMs = millis();
+    const size_t bytesWritten = Update.write(buffer, bytesRead);
+    totalWritten += bytesWritten;
+    if (bytesWritten != static_cast<size_t>(bytesRead)) {
+      error = "write_mismatch_" + String(totalWritten) + "_" + String(contentLength);
+      Update.end();
+      client.stop();
+      return false;
+    }
   }
 
   if (!Update.end()) {
     error = "update_end_failed";
+    client.stop();
+    return false;
+  }
+
+  if (totalWritten != static_cast<size_t>(contentLength)) {
+    error = "write_incomplete_" + String(totalWritten) + "_" + String(contentLength);
     client.stop();
     return false;
   }
