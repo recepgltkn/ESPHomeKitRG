@@ -7,7 +7,9 @@ Bu proje ile:
 - roleyi iPhone `Home` uygulamasina dogrudan ekleyebilirsiniz
 - roleyi HomeKit uzerinden acip kapatabilirsiniz
 - cihazi USB baglamadan OTA ile guncelleyebilirsiniz
+- GitHub'daki yeni firmware'i her dakika kontrol edip otomatik kurabilirsiniz
 - cihaz durumunu HTTP uzerinden gorebilirsiniz
+- canli bir durum panelini sayfa yenilemeden izleyebilirsiniz
 - loglari Telnet uzerinden izleyebilirsiniz
 - yeni bir eve goturdugunuzde Wi-Fi ayarlarini web arayuzunden degistirebilirsiniz
 
@@ -36,9 +38,12 @@ Eger kullandiginiz role karti ters lojik ile calisiyorsa `src/main.cpp` icindeki
 - Wi-Fi geri geldiginde HomeKit tarafini temiz toparlamak icin kontrollu restart uygular
 - `ArduinoOTA` ile kablosuz firmware guncelleme destekler
 - HTTP JSON status endpoint sunar
+- `/status` altinda canli durum paneli sunar
 - Telnet log portu sunar
 - Wi-Fi kurulum sayfasi sunar
 - mevcut ağa baglanamazsa kendi setup access point'ini acar
+- GitHub `gh-pages` uzerindeki manifest dosyasini her 60 saniyede bir kontrol eder
+- yeni surum bulursa firmware'i otomatik indirip kurar
 
 ## Proje Yapisi
 
@@ -98,6 +103,30 @@ Cihaz agda calisiyorsa USB olmadan guncelleme yapabilirsiniz:
 ```
 
 PlatformIO IP adresi gordugunde otomatik olarak `espota` kullanir.
+
+## Otomatik GitHub Guncelleme
+
+Bu proje GitHub'a push edilen yeni firmware'i otomatik alacak sekilde hazirlanmistir.
+
+Akis:
+
+- `main` branch'e push yaparsiniz
+- GitHub Actions firmware'i derler
+- `gh-pages/latest/firmware.bin` ve `gh-pages/latest/version.json` dosyalarini yayinlar
+- cihaz bu manifest'i her `60 saniyede` bir kontrol eder
+- yeni surum bulursa otomatik OTA guncelleme yapar
+
+Manifest adresi:
+
+```text
+https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/version.json
+```
+
+Not:
+
+- ilk manifest ancak workflow bir kez calistiktan sonra olusur
+- cihaz JSON icinde son update kontrol sonucunu da gosterir
+- otomatik guncelleme sirasinda cihaz kendini yeniden baslatir
 
 ## Wi-Fi Kurulum Modu
 
@@ -174,6 +203,9 @@ JSON olarak su bilgileri doner:
 - sketch boyutu
 - reset nedeni
 - servis URL bilgileri
+- otomatik update durumu
+- son bulunan uzak surum bilgisi
+- bir sonraki update kontrolune kalan sure
 
 Ornek:
 
@@ -205,6 +237,27 @@ Not:
 
 - tek istemci kabul edilir
 - ikinci telnet baglantisi reddedilir
+
+## Canli Durum Ekrani
+
+Tarayicidan:
+
+```text
+http://192.168.68.101/status
+```
+
+Bu sayfa:
+
+- 3 saniyede bir otomatik yenilenir
+- role, Wi-Fi, RSSI, heap ve surum bilgisini gosterir
+- update durumunu ve bir sonraki kontrol zamanini gosterir
+- ag, sistem ve servis detaylarini canli olarak listeler
+
+Ham JSON:
+
+```text
+http://192.168.68.101/api/status
+```
 
 ## Varsayilan Ag Servisleri
 

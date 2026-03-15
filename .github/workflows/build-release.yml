@@ -1,0 +1,60 @@
+name: Build And Publish Firmware
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build Firmware
+        env:
+          BUILD_VERSION: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${BUILD_VERSION::7}"
+          pio run --project-option="build_flags=-D APP_VERSION=\\\"${SHORT_SHA}\\\""
+
+      - name: Prepare Update Files
+        env:
+          BUILD_VERSION: ${{ github.sha }}
+          BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+        run: |
+          SHORT_SHA="${BUILD_VERSION::7}"
+          mkdir -p release/latest
+          cp .pio/build/d1_mini_homekit/firmware.bin release/latest/firmware.bin
+          cat > release/latest/version.json <<EOF
+          {
+            "version": "${SHORT_SHA}",
+            "commit": "${BUILD_VERSION}",
+            "built_at": "${BUILD_TIME}",
+            "bin_url": "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/gh-pages/latest/firmware.bin"
+          }
+          EOF
+
+      - name: Publish To gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./release
+          keep_files: true
