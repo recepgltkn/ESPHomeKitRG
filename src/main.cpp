@@ -62,6 +62,7 @@ extern homekit_characteristic_t cha_aux2_brightness;
 struct SensorConfig {
   uint16_t ldr_threshold;
   uint16_t ldr_hysteresis;
+  bool pir_enabled;
   uint32_t pir_hold_ms;
   uint16_t pir_cooldown_ms;
   int8_t temperature_offset_tenths;
@@ -118,6 +119,7 @@ static DHTesp dht;
 static SensorConfig sensorConfig = {
   550,
   40,
+  false,
   30000,
   2500,
   0,
@@ -604,18 +606,34 @@ static void loadSensorConfig() {
     return;
   }
 
-  sensorConfig.ldr_threshold = clampU16(readConfigLine(file).toInt(), 0, 1023);
-  sensorConfig.ldr_hysteresis = clampU16(readConfigLine(file).toInt(), 0, 400);
-  sensorConfig.pir_hold_ms = clampU32(readConfigLine(file).toInt(), 1000, 120000);
-  sensorConfig.pir_cooldown_ms = clampU16(readConfigLine(file).toInt(), 100, 30000);
-  sensorConfig.temperature_offset_tenths = clampI8(readConfigLine(file).toInt(), -100, 100);
-  sensorConfig.humidity_offset_tenths = clampI8(readConfigLine(file).toInt(), -100, 100);
-  sensorConfig.button_debounce_ms = clampU16(readConfigLine(file).toInt(), 50, 2000);
-  sensorConfig.aux1_inverted = readConfigLine(file) == "1";
-  sensorConfig.aux2_inverted = readConfigLine(file) == "1";
-  sensorConfig.aux1_default_brightness = clampU8(readConfigLine(file).toInt(), 0, 100);
-  sensorConfig.aux2_default_brightness = clampU8(readConfigLine(file).toInt(), 0, 100);
+  String lines[12];
+  uint8_t lineCount = 0;
+  while (file.available() && lineCount < 12) {
+    lines[lineCount++] = readConfigLine(file);
+  }
   file.close();
+
+  if (lineCount < 10) {
+    return;
+  }
+
+  sensorConfig.ldr_threshold = clampU16(lines[0].toInt(), 0, 1023);
+  sensorConfig.ldr_hysteresis = clampU16(lines[1].toInt(), 0, 400);
+
+  uint8_t index = 2;
+  if (lineCount >= 11) {
+    sensorConfig.pir_enabled = lines[index++] == "1";
+  }
+
+  sensorConfig.pir_hold_ms = clampU32(lines[index++].toInt(), 1000, 120000);
+  sensorConfig.pir_cooldown_ms = clampU16(lines[index++].toInt(), 100, 30000);
+  sensorConfig.temperature_offset_tenths = clampI8(lines[index++].toInt(), -100, 100);
+  sensorConfig.humidity_offset_tenths = clampI8(lines[index++].toInt(), -100, 100);
+  sensorConfig.button_debounce_ms = clampU16(lines[index++].toInt(), 50, 2000);
+  sensorConfig.aux1_inverted = lines[index++] == "1";
+  sensorConfig.aux2_inverted = lines[index++] == "1";
+  sensorConfig.aux1_default_brightness = clampU8(lines[index++].toInt(), 0, 100);
+  sensorConfig.aux2_default_brightness = clampU8(lines[index++].toInt(), 0, 100);
 }
 
 static bool saveSensorConfig() {
@@ -626,6 +644,7 @@ static bool saveSensorConfig() {
 
   file.println(sensorConfig.ldr_threshold);
   file.println(sensorConfig.ldr_hysteresis);
+  file.println(sensorConfig.pir_enabled ? 1 : 0);
   file.println(sensorConfig.pir_hold_ms);
   file.println(sensorConfig.pir_cooldown_ms);
   file.println(sensorConfig.temperature_offset_tenths);
@@ -756,6 +775,13 @@ static void readSensors() {
 }
 
 static void handlePirInput() {
+  if (!sensorConfig.pir_enabled) {
+    if (pirMotionState) {
+      updateMotionState(false, true);
+    }
+    return;
+  }
+
   const uint32_t now = millis();
   const bool pirSignal = digitalRead(PIR_PIN) == HIGH;
 
@@ -842,6 +868,7 @@ static String buildStatusJson() {
   body += cha_aux2_on.value.bool_value ? "true" : "false";
   body += ",\"brightness\":" + String(cha_aux2_brightness.value.int_value) + ",\"inverted\":";
   body += sensorConfig.aux2_inverted ? "true" : "false";
+  body += "}";
   body += "},";
   body += "\"sensors\":{";
   body += "\"temperature_c\":" + String(lastTemperatureC, 1) + ",";
@@ -857,9 +884,13 @@ static String buildStatusJson() {
   body += "},";
   body += "\"config\":{";
   body += "\"pins\":{\"relay\":\"D1\",\"button\":\"D2\",\"pir\":\"D5\",\"dht\":\"D6\",\"ldr\":\"A0\",\"aux1\":\"D7\",\"aux2\":\"D8\"},";
+  body += "\"pir_enabled\":";
+  body += sensorConfig.pir_enabled ? "true" : "false";
+  body += ",";
   body += "\"ldr_threshold\":" + String(sensorConfig.ldr_threshold) + ",";
   body += "\"ldr_hysteresis\":" + String(sensorConfig.ldr_hysteresis) + ",";
   body += "\"pir_hold_ms\":" + String(sensorConfig.pir_hold_ms) + ",";
+  body += "\"pir_hold_seconds\":" + String(sensorConfig.pir_hold_ms / 1000.0f, 1) + ",";
   body += "\"pir_cooldown_ms\":" + String(sensorConfig.pir_cooldown_ms) + ",";
   body += "\"temperature_offset_c\":" + String(sensorConfig.temperature_offset_tenths / 10.0f, 1) + ",";
   body += "\"humidity_offset_pct\":" + String(sensorConfig.humidity_offset_tenths / 10.0f, 1) + ",";
@@ -1186,7 +1217,8 @@ static void handleConfigPage() {
   body += "<div class='grid'>";
   body += "<label>LDR esik (0-1023)<input name='ldr_threshold' type='number' min='0' max='1023' value='" + String(sensorConfig.ldr_threshold) + "'></label>";
   body += "<label>LDR histerezis<input name='ldr_hysteresis' type='number' min='0' max='400' value='" + String(sensorConfig.ldr_hysteresis) + "'></label>";
-  body += "<label>PIR aktif tutma ms<input name='pir_hold_ms' type='number' min='1000' max='120000' value='" + String(sensorConfig.pir_hold_ms) + "'></label>";
+  body += "<label>PIR aktif 0/1<input name='pir_enabled' type='number' min='0' max='1' value='" + String(sensorConfig.pir_enabled ? 1 : 0) + "'></label>";
+  body += "<label>PIR aktif tutma sn<input name='pir_hold_seconds' type='number' min='1' max='120' step='1' value='" + String(sensorConfig.pir_hold_ms / 1000) + "'></label>";
   body += "<label>PIR cooldown ms<input name='pir_cooldown_ms' type='number' min='100' max='30000' value='" + String(sensorConfig.pir_cooldown_ms) + "'></label>";
   body += "<label>Sicaklik offset (0.1C)<input name='temperature_offset_tenths' type='number' min='-100' max='100' value='" + String(sensorConfig.temperature_offset_tenths) + "'></label>";
   body += "<label>Nem offset (0.1%)<input name='humidity_offset_tenths' type='number' min='-100' max='100' value='" + String(sensorConfig.humidity_offset_tenths) + "'></label>";
@@ -1203,7 +1235,8 @@ static void handleConfigPage() {
 static void handleConfigSave() {
   sensorConfig.ldr_threshold = clampU16(webServer.arg("ldr_threshold").toInt(), 0, 1023);
   sensorConfig.ldr_hysteresis = clampU16(webServer.arg("ldr_hysteresis").toInt(), 0, 400);
-  sensorConfig.pir_hold_ms = clampU32(webServer.arg("pir_hold_ms").toInt(), 1000, 120000);
+  sensorConfig.pir_enabled = webServer.arg("pir_enabled").toInt() == 1;
+  sensorConfig.pir_hold_ms = clampU32(webServer.arg("pir_hold_seconds").toInt() * 1000UL, 1000, 120000);
   sensorConfig.pir_cooldown_ms = clampU16(webServer.arg("pir_cooldown_ms").toInt(), 100, 30000);
   sensorConfig.temperature_offset_tenths = clampI8(webServer.arg("temperature_offset_tenths").toInt(), -100, 100);
   sensorConfig.humidity_offset_tenths = clampI8(webServer.arg("humidity_offset_tenths").toInt(), -100, 100);
@@ -1555,7 +1588,7 @@ void setup() {
   pinMode(AUX2_PWM_PIN, OUTPUT);
   analogWriteRange(1023);
   setRelay(false);
-  dht.setup(DHT_PIN, DHTesp::DHT22);
+  dht.setup(DHT_PIN, DHTesp::DHT11);
 
   loadWifiCredentials();
   loadSensorConfig();
