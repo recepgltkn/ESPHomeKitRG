@@ -3,8 +3,6 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <ArduinoOTA.h>
-#include <WiFiClientSecureBearSSL.h>
-#include <Updater.h>
 #include <DHTesp.h>
 #include <arduino_homekit_server.h>
 #include <user_interface.h>
@@ -51,9 +49,6 @@ extern homekit_characteristic_t cha_aux2_brightness;
 #define WIFI_SETUP_PASSWORD "12345678"
 #define APP_NAME "Wemos Role"
 #define STATUS_REFRESH_MS 3000UL
-#define UPDATE_CHECK_INTERVAL_MS 60000UL
-#define AUTO_UPDATE_ENABLED false
-#define UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/recepgltkn/ESPHomeKitRG/main/docs/latest/version.json"
 #define HOMEKIT_RECOVERY_IDLE_MS 180000UL
 #define HOMEKIT_RECOVERY_GRACE_MS 120000UL
 #define HOMEKIT_RECOVERY_COOLDOWN_MS 600000UL
@@ -86,16 +81,8 @@ static bool should_restart_after_reconnect = false;
 static bool setupApActive = false;
 static String wifiSsid = WIFI_SSID;
 static String wifiPassword = WIFI_PASSWORD;
-static uint32_t lastUpdateCheckMs = 0;
 static bool updateInProgress = false;
-static String lastUpdateResult = "never_checked";
-static String lastRemoteVersion = "";
-static String lastRemoteBinUrl = "";
-static String lastRemoteBuildTime = "";
-static String lastRemoteCommit = "";
-static String lastRemoteNotes = "";
-static bool updateAvailable = false;
-static uint32_t lastSuccessfulUpdateCheckMs = 0;
+static String lastUpdateResult = "arduinoota_only";
 static uint32_t homekitLastClientSeenMs = 0;
 static uint32_t homekitLastRecoveryRestartMs = 0;
 static uint32_t lastSensorReadMs = 0;
@@ -225,69 +212,6 @@ static String jsonEscape(const String &value) {
   return escaped;
 }
 
-static String extractJsonString(const String &json, const String &key) {
-  const String token = "\"" + key + "\"";
-  int keyIndex = json.indexOf(token);
-  if (keyIndex < 0) {
-    return "";
-  }
-
-  keyIndex = json.indexOf(':', keyIndex + token.length());
-  if (keyIndex < 0) {
-    return "";
-  }
-
-  int valueStart = keyIndex + 1;
-  while (valueStart < static_cast<int>(json.length()) &&
-         (json[valueStart] == ' ' || json[valueStart] == '\n' || json[valueStart] == '\r' || json[valueStart] == '\t')) {
-    valueStart++;
-  }
-
-  if (valueStart >= static_cast<int>(json.length()) || json[valueStart] != '"') {
-    return "";
-  }
-
-  valueStart++;
-  const int valueEnd = json.indexOf('"', valueStart);
-  if (valueEnd < 0) {
-    return "";
-  }
-
-  return json.substring(valueStart, valueEnd);
-}
-
-static String extractJsonValue(const String &json, const String &key) {
-  String value = extractJsonString(json, key);
-  if (value.length() > 0) {
-    return value;
-  }
-
-  const String token = "\"" + key + "\"";
-  int keyIndex = json.indexOf(token);
-  if (keyIndex < 0) {
-    return "";
-  }
-
-  keyIndex = json.indexOf(':', keyIndex + token.length());
-  if (keyIndex < 0) {
-    return "";
-  }
-
-  int valueStart = keyIndex + 1;
-  while (valueStart < static_cast<int>(json.length()) &&
-         (json[valueStart] == ' ' || json[valueStart] == '\n' || json[valueStart] == '\r' || json[valueStart] == '\t')) {
-    valueStart++;
-  }
-
-  int valueEnd = valueStart;
-  while (valueEnd < static_cast<int>(json.length()) &&
-         json[valueEnd] != ',' && json[valueEnd] != '\n' && json[valueEnd] != '\r' && json[valueEnd] != '}') {
-    valueEnd++;
-  }
-
-  return json.substring(valueStart, valueEnd);
-}
-
 static uint16_t clampU16(long value, uint16_t minValue, uint16_t maxValue) {
   if (value < minValue) {
     return minValue;
@@ -334,222 +258,6 @@ static String readConfigLine(File &file) {
   return line;
 }
 
-static bool parseHttpsUrl(const String &url, String &host, uint16_t &port, String &path) {
-  if (!url.startsWith("https://")) {
-    return false;
-  }
-
-  const int hostStart = 8;
-  const int pathStart = url.indexOf('/', hostStart);
-  const String hostPort = pathStart >= 0 ? url.substring(hostStart, pathStart) : url.substring(hostStart);
-  const int colonIndex = hostPort.indexOf(':');
-
-  if (colonIndex >= 0) {
-    host = hostPort.substring(0, colonIndex);
-    port = static_cast<uint16_t>(hostPort.substring(colonIndex + 1).toInt());
-  } else {
-    host = hostPort;
-    port = 443;
-  }
-
-  path = pathStart >= 0 ? url.substring(pathStart) : "/";
-  return host.length() > 0 && path.length() > 0;
-}
-
-static bool readHttpResponse(BearSSL::WiFiClientSecure &client, int &statusCode, int &contentLength, bool &chunked, String &headers) {
-  statusCode = -1;
-  contentLength = -1;
-  chunked = false;
-  headers = "";
-
-  const String statusLine = client.readStringUntil('\n');
-  if (!statusLine.startsWith("HTTP/1.1 ") && !statusLine.startsWith("HTTP/1.0 ")) {
-    return false;
-  }
-
-  statusCode = statusLine.substring(9, 12).toInt();
-
-  while (client.connected()) {
-    const String line = client.readStringUntil('\n');
-    if (line == "\r" || line.length() == 0) {
-      break;
-    }
-
-    headers += line;
-    const String trimmed = line.substring(0, line.length() - 1);
-    if (trimmed.startsWith("Content-Length:")) {
-      contentLength = trimmed.substring(15).toInt();
-    } else if (trimmed.startsWith("Transfer-Encoding:") && trimmed.indexOf("chunked") >= 0) {
-      chunked = true;
-    }
-  }
-
-  return true;
-}
-
-static bool httpsGetString(const String &url, String &body, String &error) {
-  String host;
-  String path;
-  uint16_t port = 443;
-  if (!parseHttpsUrl(url, host, port, path)) {
-    error = "bad_url";
-    return false;
-  }
-
-  BearSSL::WiFiClientSecure client;
-  client.setTimeout(15000);
-  client.setInsecure();
-
-  if (!client.connect(host.c_str(), port)) {
-    error = "connect_failed";
-    return false;
-  }
-
-  client.printf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: wemos-role\r\nConnection: close\r\n\r\n",
-                path.c_str(), host.c_str());
-
-  int statusCode = -1;
-  int contentLength = -1;
-  bool chunked = false;
-  String headers;
-  if (!readHttpResponse(client, statusCode, contentLength, chunked, headers)) {
-    error = "bad_response";
-    client.stop();
-    return false;
-  }
-
-  if (statusCode != 200) {
-    error = "http_" + String(statusCode);
-    client.stop();
-    return false;
-  }
-
-  if (chunked) {
-    error = "chunked_unsupported";
-    client.stop();
-    return false;
-  }
-
-  body = client.readString();
-  client.stop();
-  if (contentLength >= 0 && body.length() == 0) {
-    error = "empty_body";
-    return false;
-  }
-
-  return true;
-}
-
-static bool httpsUpdateFromUrl(const String &url, String &error) {
-  String host;
-  String path;
-  uint16_t port = 443;
-  if (!parseHttpsUrl(url, host, port, path)) {
-    error = "bad_bin_url";
-    return false;
-  }
-
-  BearSSL::WiFiClientSecure client;
-  client.setTimeout(20000);
-  client.setInsecure();
-
-  if (!client.connect(host.c_str(), port)) {
-    error = "bin_connect_failed";
-    return false;
-  }
-
-  client.printf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: wemos-role\r\nConnection: close\r\n\r\n",
-                path.c_str(), host.c_str());
-
-  int statusCode = -1;
-  int contentLength = -1;
-  bool chunked = false;
-  String headers;
-  if (!readHttpResponse(client, statusCode, contentLength, chunked, headers)) {
-    error = "bin_bad_response";
-    client.stop();
-    return false;
-  }
-
-  if (statusCode != 200) {
-    error = "bin_http_" + String(statusCode);
-    client.stop();
-    return false;
-  }
-
-  if (chunked || contentLength <= 0) {
-    error = "bin_length_missing";
-    client.stop();
-    return false;
-  }
-
-  if (!Update.begin(contentLength)) {
-    error = "update_begin_failed";
-    client.stop();
-    return false;
-  }
-
-  logf("Otomatik update basladi. Boyut: %d", contentLength);
-  uint8_t buffer[1024];
-  size_t totalWritten = 0;
-  uint32_t lastDataMs = millis();
-
-  while (totalWritten < static_cast<size_t>(contentLength)) {
-    const size_t availableBytes = client.available();
-    if (availableBytes == 0) {
-      if (!client.connected() && !client.available()) {
-        break;
-      }
-
-      if (millis() - lastDataMs > 15000) {
-        error = "update_read_timeout";
-        Update.end();
-        client.stop();
-        return false;
-      }
-
-      delay(1);
-      continue;
-    }
-
-    const size_t chunkSize = availableBytes > sizeof(buffer) ? sizeof(buffer) : availableBytes;
-    const int bytesRead = client.read(buffer, chunkSize);
-    if (bytesRead <= 0) {
-      continue;
-    }
-
-    lastDataMs = millis();
-    const size_t bytesWritten = Update.write(buffer, bytesRead);
-    totalWritten += bytesWritten;
-    if (bytesWritten != static_cast<size_t>(bytesRead)) {
-      error = "write_mismatch_" + String(totalWritten) + "_" + String(contentLength);
-      Update.end();
-      client.stop();
-      return false;
-    }
-  }
-
-  if (!Update.end()) {
-    error = "update_end_failed";
-    client.stop();
-    return false;
-  }
-
-  if (totalWritten != static_cast<size_t>(contentLength)) {
-    error = "write_incomplete_" + String(totalWritten) + "_" + String(contentLength);
-    client.stop();
-    return false;
-  }
-
-  if (!Update.isFinished()) {
-    error = "update_not_finished";
-    client.stop();
-    return false;
-  }
-
-  client.stop();
-  return true;
-}
 
 static void loadWifiCredentials() {
   if (!LittleFS.begin()) {
@@ -918,25 +626,10 @@ static String buildStatusJson() {
   body += homekitRecoveryPending ? "true" : "false";
   body += "},";
   body += "\"update\":{";
-  body += "\"auto_update_enabled\":";
-  body += AUTO_UPDATE_ENABLED ? "true" : "false";
-  body += ",";
   body += "\"current_version\":\"" APP_VERSION "\",";
-  body += "\"last_remote_version\":\"" + jsonEscape(lastRemoteVersion) + "\",";
-  body += "\"last_remote_bin_url\":\"" + jsonEscape(lastRemoteBinUrl) + "\",";
-  body += "\"last_remote_build_time\":\"" + jsonEscape(lastRemoteBuildTime) + "\",";
-  body += "\"last_remote_commit\":\"" + jsonEscape(lastRemoteCommit) + "\",";
-  body += "\"last_remote_notes\":\"" + jsonEscape(lastRemoteNotes) + "\",";
-  body += "\"manifest_url\":\"" UPDATE_MANIFEST_URL "\",";
-  body += "\"check_interval_ms\":" + String(UPDATE_CHECK_INTERVAL_MS) + ",";
-  body += "\"last_check_ms_ago\":" + String(lastUpdateCheckMs == 0 ? 0 : millis() - lastUpdateCheckMs) + ",";
-  body += "\"last_successful_check_ms_ago\":" + String(lastSuccessfulUpdateCheckMs == 0 ? 0 : millis() - lastSuccessfulUpdateCheckMs) + ",";
-  body += "\"next_check_in_ms\":" + String(lastUpdateCheckMs == 0 ? 0 : (UPDATE_CHECK_INTERVAL_MS > (millis() - lastUpdateCheckMs) ? UPDATE_CHECK_INTERVAL_MS - (millis() - lastUpdateCheckMs) : 0)) + ",";
+  body += "\"mode\":\"arduinoota_only\",";
   body += "\"in_progress\":";
   body += updateInProgress ? "true" : "false";
-  body += ",";
-  body += "\"available\":";
-  body += updateAvailable ? "true" : "false";
   body += ",";
   body += "\"last_result\":\"" + jsonEscape(lastUpdateResult) + "\"";
   body += "},";
@@ -962,82 +655,6 @@ static String buildStatusJson() {
   body += "}";
   body += "}";
   return body;
-}
-
-static bool refreshUpdateMetadata(bool forceCheck) {
-  if (WiFi.status() != WL_CONNECTED || updateInProgress) {
-    return false;
-  }
-
-  const uint32_t now = millis();
-  if (!forceCheck && lastUpdateCheckMs != 0 && now - lastUpdateCheckMs < UPDATE_CHECK_INTERVAL_MS) {
-    return true;
-  }
-  lastUpdateCheckMs = now;
-
-  String payload;
-  String requestError;
-  if (!httpsGetString(UPDATE_MANIFEST_URL, payload, requestError)) {
-    lastUpdateResult = "manifest_" + requestError;
-    return false;
-  }
-  lastSuccessfulUpdateCheckMs = now;
-
-  lastRemoteVersion = extractJsonString(payload, "version");
-  lastRemoteBinUrl = extractJsonString(payload, "bin_url");
-  lastRemoteBuildTime = extractJsonString(payload, "built_at");
-  lastRemoteCommit = extractJsonString(payload, "commit");
-  lastRemoteNotes = extractJsonString(payload, "notes");
-  if (lastRemoteNotes.length() == 0) {
-    lastRemoteNotes = extractJsonValue(payload, "notes");
-  }
-
-  if (lastRemoteVersion.length() == 0 || lastRemoteBinUrl.length() == 0) {
-    lastUpdateResult = "manifest_parse_failed";
-    return false;
-  }
-
-  if (lastRemoteVersion == APP_VERSION) {
-    updateAvailable = false;
-    lastUpdateResult = "up_to_date";
-    return true;
-  }
-
-  updateAvailable = true;
-  lastUpdateResult = "update_available";
-  return true;
-}
-
-static bool installPendingUpdate() {
-  if (WiFi.status() != WL_CONNECTED || updateInProgress) {
-    return false;
-  }
-
-  if (!refreshUpdateMetadata(true)) {
-    return false;
-  }
-
-  if (!updateAvailable || lastRemoteBinUrl.length() == 0) {
-    return false;
-  }
-
-  updateInProgress = true;
-  lastUpdateResult = "updating";
-  logf("Manuel update baslatildi. Hedef surum: %s", lastRemoteVersion.c_str());
-
-  String updateError;
-  if (httpsUpdateFromUrl(lastRemoteBinUrl, updateError)) {
-    lastUpdateResult = "update_ok";
-    logf("Manuel update tamamlandi. Yeniden baslatiliyor.");
-    delay(500);
-    ESP.restart();
-    return true;
-  }
-
-  updateInProgress = false;
-  lastUpdateResult = "update_" + updateError;
-  logf("Manuel update hatasi: %s", updateError.c_str());
-  return false;
 }
 
 static void setSwitchState(bool on, bool notifyHomeKit) {
@@ -1318,23 +935,18 @@ static void handleStatusPage() {
   body += "set('aux2',`${d.outputs.aux2.brightness}%`,d.outputs.aux2.on?'good':'warn');";
   body += "set('version',d.update.current_version,'mono');";
   body += "set('update',d.update.in_progress?'YUKLENIYOR':d.update.last_result,'mono');";
-  body += "set('nextCheck',`${Math.ceil(d.update.next_check_in_ms/1000)} sn`,'mono');";
+  body += "set('nextCheck',d.update.mode,'mono');";
   body += "rows('networkRows',[['SSID',d.network.wifi_ssid],['IP',d.network.ip],['BSSID',d.network.bssid],['Kanal',d.network.channel],['RSSI',`${d.network.rssi} dBm`],['Reconnect',d.network.reconnect_count],['Retry',d.network.retry_count],['Setup AP',d.network.setup_ap_active?'ACIK':'KAPALI']]);";
   body += "rows('systemRows',[['Uptime(ms)',d.system.uptime_ms],['Reset',d.system.reset_reason],['Fragmentation',d.system.heap_fragmentation],['Max block',d.system.max_free_block],['Sketch',d.system.sketch_size],['Clients',d.homekit.clients],['Son istemci',`${Math.floor(d.homekit.last_client_seen_ms_ago/1000)} sn once`],['Recovery',d.homekit.recovery_pending?'BEKLIYOR':'NORMAL'],['LDR raw',d.sensors.ldr_raw],['Karanlik',d.sensors.ldr_dark?'EVET':'HAYIR']]);";
-  body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Config',d.services.config],['PWM1',`${d.outputs.aux1.gpio} / ${d.outputs.aux1.inverted?'INV':'NOR'}`],['PWM2',`${d.outputs.aux2.gpio} / ${d.outputs.aux2.inverted?'INV':'NOR'}`],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Manifest',d.update.manifest_url],['Yeni surum',d.update.last_remote_version||'-']]);";
+  body += "rows('serviceRows',[['Setup',d.services.setup],['HTTP',d.services.http],['Status',d.services.status],['Config',d.services.config],['PWM1',`${d.outputs.aux1.gpio} / ${d.outputs.aux1.inverted?'INV':'NOR'}`],['PWM2',`${d.outputs.aux2.gpio} / ${d.outputs.aux2.inverted?'INV':'NOR'}`],['Telnet',d.services.telnet],['OTA Host',d.services.ota_host],['Update Mode',d.update.mode]]);";
   body += "}catch(e){set('update','baglanti hatasi','warn');}} load(); setInterval(load," + String(STATUS_REFRESH_MS) + ");";
   body += "</script></body></html>";
   webServer.send(200, "text/html; charset=utf-8", body);
 }
 
 static void handleUpdatePage() {
-  refreshUpdateMetadata(true);
-
-  String notes = lastRemoteNotes;
-  notes.replace("\\n", "\n");
-
   String body;
-  body.reserve(6000);
+  body.reserve(3600);
   body += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   body += "<title>Wemos Update</title><style>";
   body += ":root{--bg:#f2efe8;--card:#fffdf8;--ink:#171512;--muted:#6a635a;--line:#ddd5c7;--accent:#0d6b5f;--warn:#9a3412}";
@@ -1350,81 +962,28 @@ static void handleUpdatePage() {
   body += "<div class='hero'><div><div class='label'>Manuel Firmware Guncelleme</div><h1 style='margin:6px 0 0'>/update</h1></div><div class='mono'>Cihaz: " + String(deviceName) + "</div></div>";
   body += "<div class='grid'>";
   body += "<div class='card'><div class='label'>Mevcut Surum</div><div class='value mono'>" APP_VERSION "</div></div>";
-  body += "<div class='card'><div class='label'>Son Bulunan Surum</div><div class='value mono'>";
-  body += lastRemoteVersion.length() > 0 ? htmlEscape(lastRemoteVersion) : "-";
-  body += "</div></div>";
-  body += "<div class='card'><div class='label'>Durum</div><div id='updateState' class='value mono ";
-  body += updateAvailable ? "ok" : "warn";
-  body += "'>";
-  body += htmlEscape(lastUpdateResult);
-  body += "</div></div>";
+  body += "<div class='card'><div class='label'>OTA Modu</div><div class='value mono ok'>ArduinoOTA</div></div>";
+  body += "<div class='card'><div class='label'>Durum</div><div id='updateState' class='value mono ok'>hazir</div></div>";
   body += "</div>";
-  body += "<div class='card'><div style='display:flex;gap:12px;flex-wrap:wrap'>";
-  body += "<button id='checkBtn' class='alt' onclick='runAction(\"check\")'>Yenilikleri Kontrol Et</button>";
-  body += "<button id='installBtn' onclick='runAction(\"install\")'";
-  if (!updateAvailable || updateInProgress) {
-    body += " disabled";
-  }
-  body += ">Surumu Yukle</button></div>";
-  body += "<div id='flashMsg' class='mono' style='margin-top:12px;color:var(--muted)'>Yukleme sirasinda cihaz yeniden baslayabilir.</div></div>";
-  body += "<div class='card'><div class='label'>Yenilikler</div><pre id='notes'>";
-  if (notes.length() > 0) {
-    body += htmlEscape(notes);
-  } else {
-    body += "Manifest notu yok. Commit: " + htmlEscape(lastRemoteCommit) + "\nBuild: " + htmlEscape(lastRemoteBuildTime);
-  }
+  body += "<div class='card'><div class='label'>Kullanim</div><pre>";
+  body += "Bu cihazda web arayuzunden manifest tabanli update kapatildi.\n";
+  body += "Yeni firmware'i ayni agdan dogrudan ArduinoOTA ile gonderin.\n\n";
+  body += "Ornek komut:\n";
+  body += "pio run -e d1_mini_homekit -t upload --upload-port " + WiFi.localIP().toString() + "\n";
+  body += "Alternatif host:\n";
+  body += String(otaHostname) + ".local";
   body += "</pre></div>";
   body += "<div class='card'><div class='label'>Detay</div>";
-  body += "<div class='row'><span>Commit</span><span class='mono' id='commit'>" + htmlEscape(lastRemoteCommit) + "</span></div>";
-  body += "<div class='row'><span>Build Time</span><span class='mono' id='builtAt'>" + htmlEscape(lastRemoteBuildTime) + "</span></div>";
-  body += "<div class='row'><span>Manifest</span><span class='mono'><a href='" UPDATE_MANIFEST_URL "'>" UPDATE_MANIFEST_URL "</a></span></div>";
-  body += "<div class='row'><span>Firmware</span><span class='mono' id='binUrl'>" + htmlEscape(lastRemoteBinUrl) + "</span></div>";
-  body += "</div>";
-  body += "</div><script>";
-  body += "async function load(){const r=await fetch('/api/status',{cache:'no-store'});return r.json();}";
-  body += "function sync(d){document.getElementById('updateState').textContent=d.update.last_result;";
-  body += "document.getElementById('notes').textContent=d.update.last_remote_notes||(`Manifest notu yok. Commit: ${d.update.last_remote_commit}\\nBuild: ${d.update.last_remote_build_time}`);";
-  body += "document.getElementById('commit').textContent=d.update.last_remote_commit||'-';";
-  body += "document.getElementById('builtAt').textContent=d.update.last_remote_build_time||'-';";
-  body += "document.getElementById('binUrl').textContent=d.update.last_remote_bin_url||'-';";
-  body += "document.getElementById('installBtn').disabled=!d.update.available||d.update.in_progress;}";
-  body += "async function runAction(kind){const msg=document.getElementById('flashMsg');msg.textContent='Islem baslatiliyor...';";
-  body += "const res=await fetch(kind==='check'?'/api/update/check':'/api/update/install',{method:'POST'});const data=await res.json();";
-  body += "msg.textContent=data.message||data.result||'Tamam';const state=await load();sync(state);} load().then(sync); setInterval(()=>load().then(sync).catch(()=>{}),5000);";
-  body += "</script></body></html>";
+  body += "<div class='row'><span>OTA Host</span><span class='mono'>" + String(otaHostname) + ".local</span></div>";
+  body += "<div class='row'><span>OTA Port</span><span class='mono'>8266</span></div>";
+  body += "<div class='row'><span>Hedef IP</span><span class='mono'>" + WiFi.localIP().toString() + "</span></div>";
+  body += "</div></div></body></html>";
   webServer.send(200, "text/html; charset=utf-8", body);
-}
-
-static void handleUpdateCheck() {
-  const bool ok = refreshUpdateMetadata(true);
-  String body = "{\"ok\":";
-  body += ok ? "true" : "false";
-  body += ",\"result\":\"" + jsonEscape(lastUpdateResult) + "\",\"message\":\"";
-  body += ok ? "Guncelleme bilgisi yenilendi." : "Manifest okunamadi.";
-  body += "\"}";
-  webServer.send(ok ? 200 : 500, "application/json", body);
-}
-
-static void handleUpdateInstall() {
-  if (updateInProgress) {
-    webServer.send(409, "application/json", "{\"ok\":false,\"result\":\"busy\",\"message\":\"Guncelleme zaten suruyor.\"}");
-    return;
-  }
-
-  const bool started = installPendingUpdate();
-  String body = "{\"ok\":";
-  body += started ? "true" : "false";
-  body += ",\"result\":\"" + jsonEscape(lastUpdateResult) + "\",\"message\":\"";
-  body += started ? "Yukleme baslatildi. Cihaz yeniden baslayabilir." : "Yukleme baslatilamadi.";
-  body += "\"}";
-  webServer.send(started ? 200 : 500, "application/json", body);
 }
 
 static void setupWebServer() {
   webServer.on("/", handleRoot);
   webServer.on("/api/status", handleApiStatus);
-  webServer.on("/api/update/check", HTTP_POST, handleUpdateCheck);
-  webServer.on("/api/update/install", HTTP_POST, handleUpdateInstall);
   webServer.on("/status", handleStatusPage);
   webServer.on("/update", HTTP_GET, handleUpdatePage);
   webServer.on("/config", HTTP_GET, handleConfigPage);
@@ -1465,17 +1024,6 @@ static void handleTelnet() {
   if (telnetClient && !telnetClient.connected()) {
     telnetClient.stop();
   }
-}
-
-static void checkForUpdates() {
-  if (!AUTO_UPDATE_ENABLED) {
-    if (lastUpdateResult == "never_checked") {
-      lastUpdateResult = "disabled";
-    }
-    return;
-  }
-
-  refreshUpdateMetadata(false);
 }
 
 static void handleHomeKitHealth() {
@@ -1619,7 +1167,6 @@ void loop() {
   handleTelnet();
   webServer.handleClient();
   if (WiFi.status() == WL_CONNECTED) {
-    checkForUpdates();
     ArduinoOTA.handle();
     arduino_homekit_loop();
     handleHomeKitHealth();
