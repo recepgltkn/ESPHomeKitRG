@@ -53,6 +53,8 @@ extern homekit_characteristic_t cha_aux2_brightness;
 #define HOMEKIT_RECOVERY_GRACE_MS 120000UL
 #define HOMEKIT_RECOVERY_COOLDOWN_MS 600000UL
 #define SENSOR_READ_INTERVAL_MS 5000UL
+#define AUX_FADE_STEP 12
+#define AUX_FADE_INTERVAL_MS 12UL
 
 struct SensorConfig {
   uint16_t ldr_threshold;
@@ -67,6 +69,12 @@ struct SensorConfig {
   bool aux2_inverted;
   uint8_t aux1_default_brightness;
   uint8_t aux2_default_brightness;
+};
+
+struct AuxPwmState {
+  uint8_t pin;
+  int current_pwm;
+  int target_pwm;
 };
 
 static uint32_t next_status_log_ms = 0;
@@ -117,13 +125,19 @@ static SensorConfig sensorConfig = {
   100,
   100
 };
+static AuxPwmState auxPwmStates[2] = {
+  {AUX1_PWM_PIN, 1023, 1023},
+  {AUX2_PWM_PIN, 1023, 1023}
+};
 static float lastTemperatureC = 20.0f;
 static float lastHumidityPct = 50.0f;
 static uint16_t lastLdrRaw = 0;
 static float lastLux = 10.0f;
+static uint32_t lastAuxFadeMs = 0;
 static void setSwitchState(bool on, bool notifyHomeKit);
 static void setMainBrightness(int value, bool notifyHomeKit);
 static void applyAuxOutput(uint8_t channel, bool on, int brightness, bool notifyHomeKit);
+static void updateAuxFade();
 
 static void logf(const char *fmt, ...) {
   char buffer[256];
@@ -152,12 +166,50 @@ static int brightnessToPwm(const int brightness, const bool inverted) {
   return pwm;
 }
 
+static void writeAuxPwmNow(const uint8_t channel, const int pwmValue) {
+  AuxPwmState &state = auxPwmStates[channel - 1];
+  state.current_pwm = pwmValue;
+  state.target_pwm = pwmValue;
+  analogWrite(state.pin, pwmValue);
+}
+
+static void updateAuxFade() {
+  const uint32_t now = millis();
+  if (now - lastAuxFadeMs < AUX_FADE_INTERVAL_MS) {
+    return;
+  }
+  lastAuxFadeMs = now;
+
+  for (uint8_t i = 0; i < 2; i++) {
+    AuxPwmState &state = auxPwmStates[i];
+    if (state.current_pwm == state.target_pwm) {
+      continue;
+    }
+
+    if (state.current_pwm < state.target_pwm) {
+      state.current_pwm += AUX_FADE_STEP;
+      if (state.current_pwm > state.target_pwm) {
+        state.current_pwm = state.target_pwm;
+      }
+    } else {
+      state.current_pwm -= AUX_FADE_STEP;
+      if (state.current_pwm < state.target_pwm) {
+        state.current_pwm = state.target_pwm;
+      }
+    }
+
+    analogWrite(state.pin, state.current_pwm);
+  }
+}
+
 static void applyAuxOutput(uint8_t channel, bool on, int brightness, bool notifyHomeKit) {
   const int effectiveBrightness = on ? (brightness < 1 ? 1 : brightness) : 0;
-  const int pwmValue = brightnessToPwm(effectiveBrightness, channel == 1 ? sensorConfig.aux1_inverted : sensorConfig.aux2_inverted);
+  const bool inverted = true;
+  const int pwmValue = brightnessToPwm(effectiveBrightness, inverted);
+  AuxPwmState &state = auxPwmStates[channel - 1];
+  state.target_pwm = pwmValue;
 
   if (channel == 1) {
-    analogWrite(AUX1_PWM_PIN, pwmValue);
     cha_aux1_on.value.bool_value = on;
     cha_aux1_brightness.value.int_value = on ? effectiveBrightness : 0;
     if (notifyHomeKit) {
@@ -167,7 +219,6 @@ static void applyAuxOutput(uint8_t channel, bool on, int brightness, bool notify
     return;
   }
 
-  analogWrite(AUX2_PWM_PIN, pwmValue);
   cha_aux2_on.value.bool_value = on;
   cha_aux2_brightness.value.int_value = on ? effectiveBrightness : 0;
   if (notifyHomeKit) {
@@ -1135,6 +1186,8 @@ void setup() {
   pinMode(AUX1_PWM_PIN, OUTPUT);
   pinMode(AUX2_PWM_PIN, OUTPUT);
   analogWriteRange(1023);
+  writeAuxPwmNow(1, 1023);
+  writeAuxPwmNow(2, 1023);
   setRelay(false);
   dht.setup(DHT_PIN, DHTesp::DHT11);
 
@@ -1164,6 +1217,7 @@ void loop() {
   handleButtonInput();
   handlePirInput();
   readSensors();
+  updateAuxFade();
   handleTelnet();
   webServer.handleClient();
   if (WiFi.status() == WL_CONNECTED) {
